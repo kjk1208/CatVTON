@@ -1,17 +1,18 @@
-# ddp_train_stage1.py — SD3.5 CatVTON (DDP-ready, 33ch concat path)
-# - Train: DDPM (v-pred) with inpainting-style forward
-#   x_t = Mi*Xi_noisy + (1−Mi)*z0_noisy
-# - Infer/Preview: FlowMatch Euler + per-step recomposition (hard preservation)
-# - Zero-text embeds (cross-attn effectively off); freeze only self-attn Q/K/V/Out
-# - 33ch concat: [z_t(16) , Xi(16) , Mi(1)] → projector(33→16) → transformer
-# - Hole-weighted loss on true hole(1−Mi), not on left-half assumption
+# ddp_train_stage1.py — SD3.5 CatVTON (DDP-ready, 33ch concat path, patched for true inpainting)
+# - Train: FlowMatch (ε-target) + masked latent x0 reconstruction
+# - Infer/Preview: FlowMatch Euler (ε) + per-step recomposition (+ optional inpaint-start)
+# - Zero-text embeds; freeze only self-attn Q/K/V/Out
+# - 33ch concat: [z_t(16), Xi(16), Mi(1)] → projector(33→16) → transformer
+# - HOLE-only warmup → hole-weighted loss (+ masked latent recon, + keep-consistency)
+# - Adapter alpha warmup, cond-dropout warmup, projector HOLE-gate warmup
+# - Param groups: transformer lr vs projector lr
 
 import os
 import re
 import json
 import random
 import argparse
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from datetime import datetime
 import logging
 import itertools
@@ -36,18 +37,12 @@ try:
 except Exception:
     yaml = None
 
-# ------------------------------------------------------------
-# Speed/precision knobs
-# ------------------------------------------------------------
 torch.backends.cuda.matmul.allow_tf32 = True
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-# ------------------------------------------------------------
-# Diffusers (SD3.5 / SD3)
-# ------------------------------------------------------------
 try:
     from diffusers import StableDiffusion3Pipeline
     from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
@@ -58,7 +53,7 @@ except Exception as e:
     ) from e
 
 try:
-    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DDPMScheduler
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler as FM
 except Exception as e:
     raise ImportError("Schedulers not found. Please update diffusers (>=0.34).") from e
 
@@ -210,7 +205,7 @@ class PairListDataset(Dataset):
 
         x_concat_in = torch.cat([x_p_in, x_g], dim=2)      # [3,H,2W]
         x_concat_gt = torch.cat([x_p, x_g], dim=2)         # [3,H,2W]
-        m_concat = torch.cat([m, torch.zeros_like(m)], dim=2)  # [1,H,2W] (right half = 0)
+        m_concat = torch.cat([m, torch.ones_like(m)], dim=2)  # [1,H,2W] (right half = 1)
 
         return {"x_concat_in": x_concat_in, "x_concat_gt": x_concat_gt, "m_concat": m_concat}
 
@@ -381,25 +376,15 @@ class CatVTON_SD3_Trainer:
         self.transformer: SD3Transformer2DModel = pipe.transformer
         self.encode_prompt = pipe.encode_prompt
 
-        # ---- Inference scheduler (FlowMatch Euler) ----
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
-        pt = getattr(self.scheduler.config, "prediction_type", None)
-        if pt != "v_prediction":
-            self.scheduler.register_to_config(prediction_type="v_prediction")
-            if self.is_main:
-                self.logger.info(f"[sched] force prediction_type=v_prediction (was {pt})")
-        else:
-            if self.is_main:
-                self.logger.info("[sched] prediction_type=v_prediction")
-
-        # ---- Training scheduler (DDPM) ----
-        self.train_scheduler = DDPMScheduler(
-            num_train_timesteps=1000,
-            beta_schedule="linear",
-            prediction_type="v_prediction"
-        )
-
+        # ---- Schedulers ----
+        self.train_scheduler = FM.from_config(pipe.scheduler.config)
+        self.scheduler       = FM.from_config(pipe.scheduler.config)
+        # <<< FIX: 스케줄러 prediction_type을 모델 원본 설정에 맞춤
+        pred_type = getattr(pipe.scheduler.config, "prediction_type", "epsilon")
+        self.train_scheduler.config.prediction_type = pred_type
+        self.scheduler.config.prediction_type       = pred_type
         if self.is_main:
+            self.logger.info(f"[sched] training/inference = FlowMatchEuler (pred={pred_type})")
             self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
 
         # memory knobs (before DDP wrap)
@@ -413,10 +398,7 @@ class CatVTON_SD3_Trainer:
             if self.is_main: print(msg)
             self.logger.info(msg)
 
-        # attention backend (no custom wrappers)
-        attn_mode = apply_attention_backend(
-            self.transformer, self.logger, prefer_xformers=cfg.prefer_xformers
-        )
+        attn_mode = apply_attention_backend(self.transformer, self.logger, prefer_xformers=cfg.prefer_xformers)
         if self.is_main:
             self.logger.info(f"[mem] attention_backend={attn_mode}")
 
@@ -442,17 +424,14 @@ class CatVTON_SD3_Trainer:
         if self.dtype == torch.float16:
             for _, p in self.transformer.named_parameters():
                 if p.requires_grad and p.dtype != torch.float32:
-                    p.data = p.data.to(torch.float32)
-                    casted += 1
-        msg = f"[dtype] casted_trainable_to_fp32={casted}"
-        if self.is_main: print(msg)
-        self.logger.info(msg)
+                    p.data = p.data.to(torch.float32); casted += 1
+        if self.is_main:
+            self.logger.info(f"[dtype] casted_trainable_to_fp32={casted}")
 
         proj_params = sum(p.numel() for p in self.projector.parameters())
         if self.is_main:
             self.logger.info(f"[freeze] sample_trainable_params (up to 16): {', '.join(keep_names_sample)}")
             print(f"Trainable params (unique): transformer={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.4f}M")
-            self.logger.info(f"Trainable params (unique): transformer={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.4f}M")
             _debug_print_trainables(self.transformer, "after_freeze_before_ddp")
 
         # data
@@ -490,10 +469,6 @@ class CatVTON_SD3_Trainer:
         self.logger.info(f"[amp] dtype={self.dtype}, use_scaler={self.use_scaler}")
         self.scaler = None
 
-        # flags for safe scaling
-        self._has_scale_model_input_infer = hasattr(self.scheduler, "scale_model_input")
-        self._has_scale_model_input_train = hasattr(self.train_scheduler, "scale_model_input")
-
         # DDP wrap
         self.transformer = DDP(
             self.transformer, device_ids=[self.local_rank], output_device=self.local_rank,
@@ -511,13 +486,15 @@ class CatVTON_SD3_Trainer:
         if self.is_main:
             _debug_print_trainables(self.transformer.module, "after_ddp")
 
-        # optimizer
-        optim_params = itertools.chain(
-            (p for p in self.transformer.parameters() if p.requires_grad),
-            self.projector.parameters()
-        )
+        # ------- optimizer: param groups (transformer vs projector) -------
+        tf_params   = [p for p in self.transformer.parameters() if p.requires_grad]
+        proj_params = list(self.projector.parameters())
         self.optimizer = torch.optim.AdamW(
-            optim_params, lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+            [
+                {"params": tf_params,   "lr": cfg.lr},
+                {"params": proj_params, "lr": cfg.proj_lr},
+            ],
+            betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
         )
 
         if self._loaded_ckpt_optimizer is not None:
@@ -532,14 +509,11 @@ class CatVTON_SD3_Trainer:
 
         self._epoch_loss_sum = 0.0
         self._epoch_loss_count = 0
-
-        # preview noise generator
         self._preview_gen = torch.Generator(device=self.device).manual_seed(cfg.preview_seed)
+        self._mask_keep_logged = False  # <<< FIX: 마스크 극성 빠른 점검 로그 1회용 플래그
 
     def _encode_prompts(self, bsz: int):
         empties = [""] * bsz
-
-        # zero-text mode (default)
         if getattr(self.cfg, "disable_text", True):
             if not hasattr(self, "_enc_shapes"):
                 with torch.no_grad():
@@ -560,7 +534,6 @@ class CatVTON_SD3_Trainer:
             ppe = torch.zeros((bsz, self._ppe_dim),                dtype=self.dtype, device=self.device)
             return pe, ppe
 
-        # encode empties if text enabled
         try:
             pe, _, ppe, _ = self.encode_prompt(
                 prompt=empties, prompt_2=empties, prompt_3=empties,
@@ -576,170 +549,348 @@ class CatVTON_SD3_Trainer:
     def _denorm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
 
-    # --- timesteps helpers ---
-    def _as_1d_timesteps(self, sample: torch.Tensor, t, B: int, scheduler) -> torch.Tensor:
-        if not torch.is_tensor(t):
-            t = torch.tensor([t], device=sample.device)
-        t = t.to(sample.device)
-        if t.ndim == 0:
-            t = t[None]
-        tdtype = getattr(scheduler, "timesteps", torch.tensor([], device=sample.device)).dtype \
-                 if hasattr(scheduler, "timesteps") else torch.long
-        t = t.to(tdtype)
-        if t.shape[0] != B:
-            t = t[:1].repeat(B)
-        return t
-
-    def _scale_model_input_safe(self, sample: torch.Tensor, timesteps, scheduler) -> torch.Tensor:
-        has_func = (scheduler is self.scheduler and self._has_scale_model_input_infer) or \
-                   (scheduler is self.train_scheduler and self._has_scale_model_input_train)
-        if not has_func:
-            return sample
+    def _fm_scale(self, x: torch.Tensor, sigma) -> torch.Tensor:
+        # (호환용): 스케줄러 함수가 없을 때만 사용
+        if not torch.is_tensor(sigma):
+            sigma = torch.tensor(sigma, device=x.device, dtype=torch.float32)
+        sigma = sigma.to(device=x.device, dtype=torch.float32)
+        if sigma.ndim == 0:
+            sigma = sigma[None]
+        s = sigma.view(-1, *([1] * (x.ndim - 1)))
+        x_f32 = x.float()
+        x_scaled = x_f32 / torch.sqrt(s * s + 1.0)
+        return x_scaled.to(x.dtype)
+    
+    def _ensure_fm_sigmas(self, scheduler, num_steps: int) -> torch.Tensor:
+        # <<< FIX: 항상 마지막이 0이 되도록 보장
+        scheduler.set_timesteps(num_steps, device=self.device)
+        sigmas = getattr(scheduler, "sigmas", None)
+        if not (torch.is_tensor(sigmas) and sigmas.numel() > 0):
+            sigma_min = float(getattr(scheduler.config, "sigma_min", 0.03))
+            sigma_max = float(getattr(scheduler.config, "sigma_max", 14.61))
+            rho = float(getattr(scheduler.config, "rho", 7.0))
+            i = torch.linspace(0, 1, num_steps, device=self.device, dtype=torch.float32)
+            sigmas = (sigma_max ** (1.0 / rho) + i * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))) ** rho
+        sigmas = sigmas.to(device=self.device, dtype=torch.float32)
+        if sigmas[-1] != 0:
+            sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
         try:
-            B = sample.shape[0]
-            t1d = self._as_1d_timesteps(sample, timesteps, B, scheduler)
-            return scheduler.scale_model_input(sample, t1d)
-        except Exception as e:
-            self.logger.info(f"[scale_model_input_safe] bypass: {e}")
-            return sample
+            scheduler.sigmas = sigmas.clone()
+            scheduler.timesteps = sigmas.clone()
+        except Exception:
+            pass
+        return sigmas
 
+    # --- preview helpers ---
     @torch.no_grad()
-    def _preview_sample(self, batch: Dict[str, torch.Tensor], num_steps: int) -> torch.Tensor:
-        """Img2img-style preview with per-step recomposition for hard preservation."""
+    def _preview_sample(self, batch, num_steps: int, adapter_alpha: float, global_step: int = 0):
+        """
+        SD3.5 inpaint 프리뷰 (패치 버전)
+        - 시작 상태를 학습 분포와 정렬: 오른쪽 = Xi + σ·noise, 왼쪽 = σ·noise
+        - z/noise는 float32 유지, 모델 I/O만 self.dtype
+        - per-step 재합성에서도 동일 noise 사용해 KEEP 분포 고정
+        """
         H, W = self.cfg.size_h, self.cfg.size_w
         x_in = batch["x_concat_in"].to(self.device, self.dtype)
         m    = batch["m_concat"].to(self.device, self.dtype)
 
-        Xi = to_latent_sd3(self.vae, x_in).to(self.dtype)
-        Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
-        B, C, h, w = Xi.shape
+        # latents & mask
+        Xi = to_latent_sd3(self.vae, x_in).to(self.dtype)                      # [B,16,H/8,2W/8]
+        Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)  # [B,1,h,w]
+        K  = Mi.float()
+        Hmask = 1.0 - K
+        B = Xi.shape[0]
 
-        # timesteps / start from t_start (strength)
-        self.scheduler.set_timesteps(num_steps, device=self.device)
-        T = len(self.scheduler.timesteps)
-        s = float(max(0.0, min(1.0, float(self.cfg.preview_strength))))
-        init_timestep = min(int(T * s), T)
-        t_start = max(T - init_timestep, 0)
-        timesteps = self.scheduler.timesteps[t_start:]
-        if timesteps.numel() == 0:
-            timesteps = self.scheduler.timesteps[-1:].clone()
-            t_start = T - 1
+        # sigmas
+        sched_full = FM.from_config(self.scheduler.config)
+        sigmas_full = self._ensure_fm_sigmas(sched_full, max(2, int(num_steps)))
+        if sigmas_full.numel() < 2:
+            return self._denorm(x_in)
 
-        noise = torch.randn(Xi.shape, generator=self._preview_gen, dtype=torch.float32, device=Xi.device)
+        s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
+        start_idx = min(int(s * (sigmas_full.numel() - 1)), sigmas_full.numel() - 2)
+        sched, sigmas = self._build_preview_scheduler(num_steps, start_idx)
 
+        # float32 noise / state
+        noise = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=self._preview_gen)
+
+        sigma0 = sigmas[0].to(Xi.device, torch.float32)
+
+        # 시작 상태: z = σ·noise + (오른쪽만) Xi
+        mid = Xi.shape[-1] // 2
+        K_right_lat = torch.zeros_like(Mi)
+        K_right_lat[..., :, :, mid:] = 1.0
+        z = (sigma0 * noise + K_right_lat * Xi.float()).to(torch.float32)      # z는 끝까지 float32
+
+        # prompt
+        prompt_embeds, pooled = self._encode_prompts(B)
+        model    = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+        proj_net = self.projector.module   if isinstance(self.projector, DDP)   else self.projector
+
+        was_train = self.transformer.training
+        self.transformer.eval()
         try:
-            z = self.scheduler.add_noise(Xi.float(), noise, timesteps[0]).to(self.dtype)
+            for i in range(sigmas.numel() - 1):
+                sigma_t   = sigmas[i].to(Xi.device, torch.float32)
+                sigma_t_b = sigma_t.expand(B)
+
+                # preconditioning
+                try:
+                    z_in = sched.scale_model_input(z, sigma_t_b)
+                except Exception:
+                    z_in = self._fm_scale(z, sigma_t_b)
+                z_in_f32 = z_in.float()
+
+                # 33ch concat → projector (fp32)
+                hidden_cat = torch.cat([z_in_f32, Xi.float(), Mi.float()], dim=1)
+                hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    proj = proj_net(hidden_cat).float()
+
+                # 게이팅 워밍업 동안 HOLE만
+                gate_steps = int(self.cfg.get("proj_hole_gate_warmup_steps", 4000))
+                if global_step < gate_steps:
+                    proj = proj * Hmask
+
+                # norm match
+                if self.cfg.norm_match_adapter:
+                    eps = 1e-6
+                    scale = (z_in_f32.flatten(1).norm(dim=1, keepdim=True) /
+                            (proj.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
+                    proj = proj * scale.clamp(0.0, float(self.cfg.norm_match_clip))
+
+                # 모델 입력만 self.dtype
+                hidden_in = (z_in_f32 + float(adapter_alpha) * proj).to(self.dtype)
+
+                with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):
+                    eps_pred = model(
+                        hidden_states=hidden_in,
+                        timestep=sigma_t_b,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled,
+                        return_dict=True,
+                    ).sample.float()  # 다시 float32
+
+                # FM Euler step (z는 float32 유지)
+                z = sched.step(eps_pred, sigma_t, z).prev_sample.float()
+
+                # per-step 재합성: 오른쪽은 Xi + σ_next·noise 유지
+                sigma_next = sigmas[i + 1].to(Xi.device, torch.float32)
+                z_keep = Xi.float() + sigma_next * noise
+                z = (K_right_lat * z_keep + (1.0 - K_right_lat) * z).float()
+
+            # decode & 최종 합성(오른쪽은 입력 복사)
+            x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
+            K3_right = torch.zeros_like(m).repeat(1, 3, 1, 1)
+            K3_right[..., :, :, x_hat.shape[-1] // 2:] = 1.0
+            x_final = K3_right * x_in + (1.0 - K3_right) * x_hat
+            return torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+        finally:
+            if was_train:
+                self.transformer.train()
+
+
+
+
+    def _build_preview_scheduler(self, num_steps: int, start_idx: int):
+        steps = max(2, int(num_steps))
+        sched = FM.from_config(self.scheduler.config)
+        sigmas_full = self._ensure_fm_sigmas(sched, steps)
+        start_idx = min(max(0, int(start_idx)), int(sigmas_full.numel()) - 2)
+        sigmas_sub = sigmas_full[start_idx:].contiguous()
+        # <<< FIX: 잘라낸 후에도 마지막 0 보장
+        if sigmas_sub[-1] != 0:
+            sigmas_sub = torch.cat([sigmas_sub, sigmas_sub.new_zeros(1)])
+        try:
+            sched.sigmas = sigmas_sub.clone()
+            sched.timesteps = sigmas_sub.clone()
+            if hasattr(sched, "step_index"):
+                sched.step_index = 0
+            if hasattr(sched, "_step_index"):
+                sched._step_index = 0
         except Exception:
-            if hasattr(self.scheduler, "sigmas"):
-                sigma = self.scheduler.sigmas[t_start].to(self.device)
-            else:
-                sigma = torch.tensor(float(getattr(self.scheduler, "init_noise_sigma", 1.0)),
-                                     device=self.device, dtype=torch.float32)
-            z = (Xi.float() + noise * sigma).to(self.dtype)
+            pass
+        return sched, sigmas_sub
+    
+    @torch.no_grad()
+    def smoke_test_base_sampler(self, batch, num_steps: int = 40):
+        """
+        샘플러/스케줄러가 정상인지 확인하는 순수 FM Euler 샘플러.
+        - projector/concat/재합성 전부 비활성화 (hidden_in = z_in)
+        - α=0과 같은 효과
+        """
+        x_in = batch["x_concat_in"].to(self.device, self.dtype)
+        B, _, Hh, Ww2 = x_in.shape
+        # latent 해상도 얻기
+        Xi = to_latent_sd3(self.vae, x_in).float()
+        sched = FM.from_config(self.scheduler.config)
+        sigmas = self._ensure_fm_sigmas(sched, max(2, int(num_steps)))
+
+        # 초기화
+        noise = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=self._preview_gen)
+        z = sigmas[0].to(noise) * noise  # float32
 
         prompt_embeds, pooled = self._encode_prompts(B)
+        model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
 
-        for i, t in enumerate(timesteps):
-            t1d = self._as_1d_timesteps(z, t, B, self.scheduler)
-            z_in = self._scale_model_input_safe(z, t1d, self.scheduler)
+        for i in range(sigmas.numel() - 1):
+            sigma_t   = sigmas[i].to(noise)
+            sigma_t_b = sigma_t.expand(B)
 
-            # 33ch concat → projector(33→16) → (z_in + α·proj)
-            hidden_cat = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)
-            hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
-            with torch.amp.autocast(device_type='cuda', enabled=False):
-                proj = (self.projector.module(hidden_cat.float()) if isinstance(self.projector, DDP)
-                        else self.projector(hidden_cat.float()))
-            proj = proj.float()
+            try:
+                z_in = sched.scale_model_input(z, sigma_t_b)
+            except Exception:
+                z_in = self._fm_scale(z, sigma_t_b)
 
-            # projector only on HOLE
-            proj = proj * (1.0 - Mi.float())
-
-            # norm match (optional)
-            if self.cfg.norm_match_adapter:
-                eps = 1e-6
-                s = (z_in.float().flatten(1).norm(dim=1, keepdim=True) /
-                    (proj.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
-                proj = proj * s.clamp(0.0, float(self.cfg.norm_match_clip))
-
-            hidden_in = (z_in.float() + self.adapter_alpha * proj).to(self.dtype)
-
-            with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
-                model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
-                v = model(
-                    hidden_states=hidden_in,
-                    timestep=t1d,
+            with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):
+                eps = model(
+                    hidden_states=z_in.to(self.dtype),                # projector 미사용
+                    timestep=sigma_t_b,
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled,
                     return_dict=True,
-                ).sample
+                ).sample.float()
+            z = sched.step(eps, sigma_t, z).prev_sample.float()
 
-            z = self.scheduler.step(v, t, z).prev_sample
-            z = z.to(self.dtype)
-
-            # Per-step recomposition (hard preservation): keep (Mi==1) ← Xi with same noise at t_next
-            if i < (len(timesteps) - 1):
-                t_next = timesteps[i + 1]
-            else:
-                t_next = torch.tensor(0, device=self.device, dtype=timesteps.dtype)
-
-            try:
-                z_keep = self.scheduler.add_noise(Xi.float(), noise, t_next).to(self.dtype)
-            except Exception:
-                if hasattr(self.scheduler, "sigmas"):
-                    idx_next = min(i + 1, len(self.scheduler.sigmas) - 1)
-                    sigma = self.scheduler.sigmas[idx_next].to(self.device)
-                else:
-                    sigma = torch.tensor(float(getattr(self.scheduler, "init_noise_sigma", 1.0)),
-                                         device=self.device, dtype=torch.float32)
-                z_keep = (Xi.float() + noise * sigma).to(self.dtype)
-
-            z = Mi.float() * z_keep + (1.0 - Mi.float()) * z
-
-        x_hat = from_latent_sd3(self.vae, z)
-        return torch.clamp((x_hat + 1.0) * 0.5, 0.0, 1.0)
+        x = from_latent_sd3(self.vae, z.to(self.dtype))
+        return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
 
     @torch.no_grad()
+    def one_step_teacher_forcing(self, x_in, x_gt, m):
+        """
+        학습 분포에서 x_t 생성 → ε̂ → z0_hat 복원 → 디코드
+        패널 외부에서도 빠르게 확인하고 싶을 때 사용.
+        """
+        H, W = self.cfg.size_h, self.cfg.size_w
+        Xi = to_latent_sd3(self.vae, x_in).float()
+        z0 = to_latent_sd3(self.vae, x_gt).float()
+        Mi = F.interpolate(m, size=(H//8, (2*W)//8), mode="nearest").float()
+        B = Xi.shape[0]
+        sigma = self._sample_sigmas(self.train_scheduler, B).view(B,1,1,1).float()
+        eps   = torch.randn(z0.shape, device=z0.device, dtype=z0.dtype)        
+        x_t   = Mi*(Xi + sigma*eps) + (1.0 - Mi)*(z0 + sigma*eps)
+
+        try:   z_in = self.train_scheduler.scale_model_input(x_t, sigma.view(B))
+        except: z_in = self._fm_scale(x_t, sigma.view(B))
+
+        hidden_cat = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)
+        hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            pj = (self.projector.module if isinstance(self.projector, DDP) else self.projector)(hidden_cat).float()
+        hidden_in = (z_in.float() + float(self.adapter_alpha)*pj).to(self.dtype)
+
+        prompt_embeds, pooled = self._encode_prompts(B)
+        with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):
+            eps_pred = (self.transformer.module if isinstance(self.transformer, DDP) else self.transformer)(
+                hidden_states=hidden_in, timestep=sigma.view(B),
+                encoder_hidden_states=prompt_embeds, pooled_projections=pooled, return_dict=True
+            ).sample.float()
+
+        z0_hat = x_t - sigma*eps_pred
+        return torch.clamp((from_latent_sd3(self.vae, z0_hat.to(self.dtype)) + 1.0)*0.5, 0.0, 1.0).detach().cpu()
+    
+    
+    @torch.no_grad()
     def _save_preview(self, batch: Dict[str, torch.Tensor], global_step: int, max_rows: int = 4):
+        """
+        패널 저장 (xi_noisy_img, pred_img_final, one_step_img 포함)
+        - one_step_img: self.one_step_teacher_forcing(x_in, x_gt, m) 호출로 간소화
+        """
         if not self.is_main:
             return
-        x_in = batch["x_concat_in"][:max_rows].to(self.device)
-        x_gt = batch["x_concat_gt"][:max_rows].to(self.device)
-        m    = batch["m_concat"][:max_rows].to(self.device)
 
-        pred_img = self._preview_sample(
-            {k: v[:max_rows] for k, v in batch.items()}, num_steps=self.cfg.preview_infer_steps
-        )
-        pred_img = pred_img.to(x_in.dtype)
+        rows = int(self.cfg.get("preview_rows", 1))
+        x_in = batch["x_concat_in"][:rows].to(self.device, self.dtype)
+        x_gt = batch["x_concat_gt"][:rows].to(self.device, self.dtype)
+        m    = batch["m_concat"][:rows].to(self.device, self.dtype)
+        if any(t.shape[0] == 0 for t in [x_in, x_gt, m]):
+            return
 
-        B, C, H, WW = x_gt.shape
-        W = WW // 2
+        # 마스크 극성 빠른 점검(1회)
+        if not self._mask_keep_logged:
+            keep_ratio = (m[:, :, :, : m.shape[-1] // 2].float().mean().item())
+            self.logger.info(f"[debug] left-half KEEP ratio ≈ {keep_ratio:.3f} (Mi=1 KEEP)")
+            self._mask_keep_logged = True
 
-        person  = x_gt[:, :, :, :W]
-        garment = x_gt[:, :, :, W:]
-        mask_keep = m[:, :, :, :W]
-        mask_vis  = mask_keep.repeat(1, 3, 1, 1)
-        masked_person = person * mask_keep
+        # xi_noisy_img (디버그용)
+        num_steps = max(2, int(self.cfg.preview_infer_steps))
+        Xi_lat = to_latent_sd3(self.vae, x_in).to(self.dtype)
+        s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
+        _, sigmas_probe = self._build_preview_scheduler(num_steps, min(int(s * (num_steps - 1)), num_steps - 2))
+        sigma0 = sigmas_probe[0].to(Xi_lat.device, torch.float32)
+        noise0 = torch.randn(Xi_lat.shape, dtype=torch.float32, device=Xi_lat.device, generator=self._preview_gen)
+        xi_noisy_img = from_latent_sd3(self.vae, (Xi_lat.float() + sigma0 * noise0).to(self.dtype))
+        xi_noisy_img = torch.clamp((xi_noisy_img + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+        
+        mini = {
+            "x_concat_in": x_in,
+            "x_concat_gt": x_gt,
+            "m_concat": m,
+        }
 
-        rows = []
-        for i in range(B):
+        # alpha 스윕 프리뷰
+        alphas: List[float] = list(self.cfg.get("preview_alpha_sweep", [self.adapter_alpha])) or [self.adapter_alpha]
+        for a in alphas:
+            # (1) inpaint 프리뷰
+            pred_img_final = self._preview_sample(
+                mini, num_steps=num_steps, adapter_alpha=float(a), global_step=global_step
+            )
+
+            # (2) one-step teacher-forcing 복원 — 인라인 블록을 함수 호출로 치환
+            one_step_img = self.one_step_teacher_forcing(x_in, x_gt, m)
+
+            # 패널 합치기
+            _, _, Hh, WW = x_gt.shape
+            Ww = WW // 2
+            person        = x_gt[:, :, :, :Ww]
+            garment       = x_gt[:, :, :, Ww:]
+            mask_keep     = m[:, :, :, :Ww]
+            mask_vis      = mask_keep.repeat(1, 3, 1, 1)
+            masked_person = person * mask_keep
+
+            def _cpu32(t): return t.detach().to('cpu', dtype=torch.float32, non_blocking=True).contiguous()
+
             tiles = [
-                self._denorm(person[i]),
-                mask_vis[i],
-                self._denorm(masked_person[i]),
-                self._denorm(garment[i]),
-                self._denorm(x_in[i]),
-                pred_img[i],
-                self._denorm(x_gt[i]),
+                _cpu32(self._denorm(person)),
+                _cpu32(mask_vis),
+                _cpu32(self._denorm(masked_person)),
+                _cpu32(self._denorm(garment)),
+                xi_noisy_img,                    # 이미 CPU
+                _cpu32(self._denorm(x_gt)),
+                pred_img_final,                  # 이미 CPU (아래 2) 참고)
+                one_step_img,                    # 이미 CPU (아래 2) 참고)
             ]
-            row = torch.cat(tiles, dim=2)
-            rows.append(row)
-        panel = torch.stack(rows, dim=0)
-        grid = make_grid(panel.to(dtype=torch.float32), nrow=1).cpu()
-        out_path = os.path.join(self.img_dir, f"step_{global_step:06d}.png")
-        save_image(grid, out_path)
-        self.logger.info(f"[img] saved preview at step {global_step}: {out_path}")
+            panel = torch.cat(tiles, dim=3)
+            grid  = make_grid(panel, nrow=1)
+            a_tag = f"{float(a):.1f}".replace(".", "_")
+            out_path = os.path.join(self.img_dir, f"step_{global_step:06d}_alpha_{a_tag}.png")
+            save_image(grid, out_path)
+            self.logger.info(f"[img] saved preview at step {global_step} (alpha={a}): {out_path}")
 
-    def step(self, batch, global_step: int):
+        # >>> 베이스 파이프라인 스모크 테스트 저장도 여기서
+        if self.cfg.get("preview_save_base", True):
+            base = self.smoke_test_base_sampler(mini, num_steps=self.cfg.preview_infer_steps)
+            save_image(make_grid(base, nrow=1),
+                    os.path.join(self.img_dir, f"step_{global_step:06d}_BASE.png"))
+
+
+    # ------ training core ------
+
+    def _sample_sigmas(self, scheduler, B: int) -> torch.Tensor:
+        device = self.device
+        has_sigmas = getattr(scheduler, "sigmas", None)
+        if torch.is_tensor(has_sigmas) and has_sigmas.numel() > 0:
+            sigma_max = float(has_sigmas.max())
+            sigma_min = float(has_sigmas.min())
+        else:
+            sigma_min = float(getattr(scheduler.config, "sigma_min", 0.03))
+            sigma_max = float(getattr(scheduler.config, "sigma_max", 14.61))
+        u = torch.rand(B, device=device)
+        return sigma_min * (sigma_max / sigma_min) ** u
+
+    def step(self, batch, global_step: int, cur_alpha: float,
+             cur_cond_dropout_p: float, hole_only: bool):
         H, W = self.cfg.size_h, self.cfg.size_w
 
         x_concat_in = batch["x_concat_in"].to(self.device, self.dtype)
@@ -747,102 +898,123 @@ class CatVTON_SD3_Trainer:
         m_concat = batch["m_concat"].to(self.device, self.dtype)
 
         with torch.no_grad():
-            Xi = to_latent_sd3(self.vae, x_concat_in).to(self.dtype)           # [B,16,H/8,2W/8]
-            z0 = to_latent_sd3(self.vae, x_concat_gt).to(self.dtype)           # [B,16,H/8,2W/8]
-            Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
+            Xi = to_latent_sd3(self.vae, x_concat_in).to(self.dtype)   # [B,16,h,w]
+            z0 = to_latent_sd3(self.vae, x_concat_gt).to(self.dtype)   # [B,16,h,w]
+            Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)  # [B,1,h,w]
 
         B = Xi.shape[0]
 
-        if self.cfg.cond_dropout_p > 0:
-            drop = (torch.rand(B, device=self.device, dtype=self.dtype) < self.cfg.cond_dropout_p).float().view(B, 1, 1, 1)
+        # cond-dropout
+        if cur_cond_dropout_p > 0:
+            drop = (torch.rand(B, device=self.device, dtype=self.dtype) < cur_cond_dropout_p).float().view(B, 1, 1, 1)
             Xi = Xi * (1.0 - drop)
             Mi = Mi * (1.0 - drop)
 
-        # ---- TRAIN scheduler for t/noise/target ----
-        timesteps = torch.randint(
-            0, self.train_scheduler.config.num_train_timesteps, (B,),
-            device=self.device, dtype=torch.long
-        )
+        K = Mi.float()
+        Hmask = 1.0 - K
 
-        # --------- inpainting forward: noisy samples & target(v-pred) ---------
-        z0_f32     = z0.float()                           # [B,16,h,w]
-        Xi_f32     = Xi.float()                           # [B,16,h,w]
-        noise_f32  = torch.randn_like(z0_f32)             # [B,16,h,w]
-        z0_noisy   = self.train_scheduler.add_noise(z0_f32, noise_f32, timesteps)
-        Xi_noisy   = self.train_scheduler.add_noise(Xi_f32, noise_f32, timesteps)
+        # sample sigma
+        sigmas = self._sample_sigmas(self.train_scheduler, B)
 
-        # x_t = Mi*Xi_noisy + (1−Mi)*z0_noisy
-        x_t_mixed  = Mi.float() * Xi_noisy + (1.0 - Mi.float()) * z0_noisy     # [B,16,h,w]
+        # inpainting forward
+        z0_f32     = z0.float()
+        Xi_f32     = Xi.float()
+        noise_f32 = torch.randn(z0_f32.shape, device=z0_f32.device, dtype=z0_f32.dtype)                 # ε
+        sigma_b11  = sigmas.view(B, 1, 1, 1).to(dtype=torch.float32)
+        z0_noisy   = z0_f32 + sigma_b11 * noise_f32
+        Xi_noisy   = Xi_f32 + sigma_b11 * noise_f32
 
-        pred_type = getattr(self.train_scheduler.config, "prediction_type", "v_prediction")
-        if pred_type == "epsilon":
-            target_f32 = noise_f32
-        elif pred_type == "v_prediction":
-            target_f32 = self.train_scheduler.get_velocity(sample=z0_f32, noise=noise_f32, timesteps=timesteps)
-        else:
-            raise ValueError(f"Unsupported prediction_type: {pred_type}")
+        # 혼합: KEEP=입력, HOLE=정답
+        x_t_mixed  = K * Xi_noisy + Hmask * z0_noisy
 
-        # --------- Preconditioning: scale x_t ONLY ---------
-        z_in = self._scale_model_input_safe(x_t_mixed, timesteps, self.train_scheduler)
+        target_f32 = noise_f32  # ε-target
 
-        # 33ch concat: [...] → projector(33→16) → (z_in + α·proj) → transformer
+        # <<< FIX: 프리컨디셔닝을 스케줄러 함수로 통일
+        try:
+            z_in = self.train_scheduler.scale_model_input(x_t_mixed, sigmas)
+        except Exception:
+            z_in = self._fm_scale(x_t_mixed, sigmas)
+
+        # 33ch concat → projector
         hidden_cat_f32 = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)  # [B,33,h,w]
         hidden_cat_f32 = torch.nan_to_num(hidden_cat_f32, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
         with torch.amp.autocast(device_type='cuda', enabled=False):
             proj_f32 = (self.projector.module(hidden_cat_f32.float()) if isinstance(self.projector, DDP)
-                        else self.projector(hidden_cat_f32.float()))
+                        else self.projector(hidden_cat_f32.float()))  # [B,16,h,w]
         proj_f32 = proj_f32.float()
 
-        # projector only on HOLE
-        proj_f32 = proj_f32 * (1.0 - Mi.float())
-
-        # norm match (optional)
         if self.cfg.norm_match_adapter:
             eps = 1e-6
             s = (z_in.float().flatten(1).norm(dim=1, keepdim=True) /
-                (proj_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
+                 (proj_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
             proj_f32 = proj_f32 * s.clamp(0.0, float(self.cfg.norm_match_clip))
 
-        hidden_in = (z_in.float() + self.adapter_alpha * proj_f32).to(self.dtype)
+        # projector HOLE-gate warmup
+        gate_steps = int(self.cfg.get("proj_hole_gate_warmup_steps", 4000))
+        if global_step < gate_steps:
+            proj_f32 = proj_f32 * Hmask
+
+        hidden_in = (z_in.float() + float(cur_alpha) * proj_f32).to(self.dtype)
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
         with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
             model = self.transformer
-            out = model(
+            eps_pred = model(
                 hidden_states=hidden_in,
-                timestep=timesteps,
+                timestep=sigmas,    # FlowMatch uses sigmas as "t"
                 encoder_hidden_states=prompt_embeds,
                 pooled_projections=pooled_prompt_embeds,
                 return_dict=True,
             ).sample
 
-        out_f32 = out.float()
+        eps_pred_f32 = eps_pred.float()
 
-        # --------- Loss: hole-weighted + (optional) keep consistency on pred_x0 ---------
-        hole = (1.0 - Mi.float())                                # [B,1,h,w]
-        wmap = 1.0 + float(self.cfg.hole_loss_weight) * hole     # weight only on HOLE
-        loss_main = torch.mean(((out_f32 - target_f32) ** 2) * wmap)
+        # --------- Losses ---------
+        hole = Hmask
+        Wlat = Mi.shape[-1]
+        Lmask = torch.zeros_like(Mi); Lmask[..., :, :, : Wlat//2] = 1.0
+        Rmask = 1.0 - Lmask
 
-        loss = loss_main
-        if getattr(self.cfg, "keep_consistency_lambda", 0.0) > 0.0:
-            # pred_x0 from v-pred: x0 = alpha * x_t - sigma * v  where a_bar = prod(alpha_t^2)
-            ac = self.train_scheduler.alphas_cumprod
-            if not torch.is_tensor(ac):
-                ac = torch.tensor(ac, device=self.device, dtype=torch.float32)
-            else:
-                ac = ac.to(self.device, dtype=torch.float32)
-            a_bar = ac[timesteps].view(B,1,1,1)
-            alpha = torch.sqrt(a_bar)
-            sigma = torch.sqrt(1.0 - a_bar)
+        # (1) ε-MSE
+        if hole_only:
+            wmap_eps = hole
+        else:
+            wmap_eps = 1.0 + float(self.cfg.hole_loss_weight) * hole
 
-            pred_x0 = alpha * x_t_mixed.float() - sigma * out_f32
-            loss_keep = torch.mean(((pred_x0 - z0_f32) ** 2) * Mi.float())
-            loss = loss + float(self.cfg.keep_consistency_lambda) * loss_keep
+        if bool(self.cfg.get("loss_sigma_weight", False)):
+            sigma_w = 1.0 / (sigma_b11 ** 2 + 1.0)
+            loss_eps = torch.mean(((eps_pred_f32 - target_f32) ** 2) * wmap_eps * sigma_w)
+        else:
+            loss_eps = torch.mean(((eps_pred_f32 - target_f32) ** 2) * wmap_eps)
 
-        if not torch.isfinite(loss) or not loss.requires_grad:
+        # (2) latent x0 재구성
+        z0_hat = x_t_mixed.float() - sigma_b11 * eps_pred_f32
+        lat_mask = Lmask
+        loss_lat = ((z0_hat - z0_f32) ** 2 * lat_mask).sum() / lat_mask.sum().clamp_min(1.0)
+
+        rec_lambda = float(self.cfg.latent_rec_lambda)
+        warmup_steps = int(getattr(self.cfg, "latent_rec_lambda_warmup_steps", 0))
+        if warmup_steps > 0 and global_step < warmup_steps:
+            rec_lambda = 0.0
+
+        # (3) KEEP consistency (옵션)
+        keep_lambda = float(self.cfg.get("keep_consistency_lambda", 0.0))
+        loss_keep = torch.tensor(0.0, device=self.device)
+        if keep_lambda > 0.0:
+            loss_keep = torch.mean(((z0_hat - z0_f32) ** 2) * K)
+
+        # (2-추가) 오른쪽(의류) 재구성
+        gar_lambda = float(self.cfg.get("garment_rec_lambda", 1.0))
+        loss_gar = (((z0_hat - z0_f32) ** 2) * Rmask).sum() / Rmask.sum().clamp_min(1.0)
+
+        loss_total = loss_eps + rec_lambda * loss_lat + gar_lambda * loss_gar + keep_lambda * loss_keep
+
+        if not torch.isfinite(loss_total) or not loss_total.requires_grad:
             return None
-        return loss
+
+        return loss_total, float(loss_eps.detach().cpu()), float(loss_lat.detach().cpu()), float(loss_keep.detach().cpu())
+
 
     def _save_ckpt(self, epoch: int, train_loss_epoch: float, global_step: int) -> str:
         ckpt_path = os.path.join(self.model_dir, f"epoch_{epoch}_loss_{train_loss_epoch:.04f}.ckpt")
@@ -899,6 +1071,16 @@ class CatVTON_SD3_Trainer:
             self.logger.info(f"[resume] loaded {resume_path} | start_epoch={self.start_epoch}, start_step={self.start_step}")
             print(f"[resume] loaded {resume_path} | start_epoch={self.start_epoch}, start_step={self.start_step}")
 
+    def _grad_norm_sum(self, module: nn.Module) -> float:
+        s = 0.0
+        for p in module.parameters():
+            if p.requires_grad and (p.grad is not None):
+                try:
+                    s += float(p.grad.detach().float().norm().cpu())
+                except Exception:
+                    pass
+        return s
+
     def train(self):
         global_step = getattr(self, "start_step", 0)
         epoch = getattr(self, "start_epoch", 0)
@@ -927,31 +1109,55 @@ class CatVTON_SD3_Trainer:
         if self.is_dist and self.sampler is not None:
             self.sampler.set_epoch(epoch)
 
+        # rolling meters for per-step component losses
+        comp_eps_sum = 0.0
+        comp_lat_sum = 0.0
+        comp_keep_sum = 0.0
+
         while global_step < self.cfg.max_steps:
             self.optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
+            comp_eps_accum = 0.0
+            comp_lat_accum = 0.0
+            comp_keep_accum = 0.0
             nonfinite = False
             reason = ""
 
+            # ----- schedules -----
+            alpha_warm = 1.0 if self.cfg.alpha_warmup_steps <= 0 else min(
+                1.0, (global_step + 1) / float(self.cfg.alpha_warmup_steps)
+            )
+            cur_alpha = float(self.adapter_alpha) * alpha_warm
+
+            if global_step < int(self.cfg.cond_dropout_warmup_steps):
+                cur_cond_dropout_p = 0.0
+            else:
+                cur_cond_dropout_p = float(self.cfg.cond_dropout_p)
+
+            hole_only = (global_step < int(self.cfg.hole_only_warmup_steps))
+
             for _ in range(self.cfg.grad_accum):
                 batch = next(data_iter)
-                loss = self.step(batch, global_step)
+                out = self.step(batch, global_step, cur_alpha, cur_cond_dropout_p, hole_only)
 
-                if (loss is None) or (not torch.isfinite(loss)) or (not loss.requires_grad):
+                if (out is None):
+                    nonfinite = True; reason = "None/NaN in forward"; break
+
+                loss, loss_eps_val, loss_lat_val, loss_keep_val = out
+
+                if (not torch.isfinite(loss)) or (not loss.requires_grad):
                     nonfinite = True
-                    if loss is None:
-                        reason = "None/NaN in forward"
-                    elif not torch.isfinite(loss):
-                        reason = "non-finite loss"
-                    else:
-                        reason = "detached loss"
-                    break
+                    reason = "non-finite/detached loss"; break
 
                 if self.use_scaler:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
+
                 loss_accum += float(loss.detach().cpu())
+                comp_eps_accum += float(loss_eps_val)
+                comp_lat_accum += float(loss_lat_val)
+                comp_keep_accum += float(loss_keep_val)
 
             if nonfinite:
                 msg = f"[warn] skipping step {global_step}: {reason}."
@@ -965,6 +1171,10 @@ class CatVTON_SD3_Trainer:
                 if self.is_main:
                     pbar.update(1)
                 continue
+
+            # grad norms (before unscale/clip/step)
+            tf_grad_norm = self._grad_norm_sum(self.transformer)
+            pj_grad_norm = self._grad_norm_sum(self.projector)
 
             do_clip = True
             if self.use_scaler:
@@ -993,24 +1203,44 @@ class CatVTON_SD3_Trainer:
             if self.is_main:
                 pbar.update(1)
 
+            # update rolling meters
             self._epoch_loss_sum += loss_accum / max(1, self.cfg.grad_accum)
             self._epoch_loss_count += 1
+            comp_eps_sum += comp_eps_accum / max(1, self.cfg.grad_accum)
+            comp_lat_sum += comp_lat_accum / max(1, self.cfg.grad_accum)
+            comp_keep_sum += comp_keep_accum / max(1, self.cfg.grad_accum)
+
             train_loss_avg = self._epoch_loss_sum / max(1, self._epoch_loss_count)
+            loss_eps_avg   = comp_eps_sum / max(1, self._epoch_loss_count)
+            loss_lat_avg   = comp_lat_sum / max(1, self._epoch_loss_count)
+            loss_keep_avg  = comp_keep_sum / max(1, self._epoch_loss_count)
 
             if self.is_main and ((global_step % self.cfg.log_every) == 0 or global_step == 1):
-                self.tb.add_scalar("train/loss", train_loss_avg, global_step)
+                self.tb.add_scalar("train/loss_total", train_loss_avg, global_step)
+                self.tb.add_scalar("train/loss_eps",   loss_eps_avg,   global_step)
+                self.tb.add_scalar("train/loss_lat",   loss_lat_avg,   global_step)
+                self.tb.add_scalar("train/loss_keep",  loss_keep_avg,  global_step)
+                self.tb.add_scalar("train/alpha", cur_alpha, global_step)
+                self.tb.add_scalar("train/cond_dropout_p", cur_cond_dropout_p, global_step)
+                self.tb.add_scalar("train/hole_only", float(hole_only), global_step)
+                self.tb.add_scalar("train/grad_norm_transformer", tf_grad_norm, global_step)
+                self.tb.add_scalar("train/grad_norm_projector",  pj_grad_norm, global_step)
                 prog = (global_step % self.steps_per_epoch) / self.steps_per_epoch if self.steps_per_epoch > 0 else 0.0
                 pct = int(prog * 100)
                 line = (f"Epoch {epoch}: {pct:3d}% | step {global_step}/{self.cfg.max_steps} "
-                        f"| loss={train_loss_avg:.4f}")
-                pbar.set_postfix_str(f"loss={train_loss_avg:.4f}")
+                        f"| total={train_loss_avg:.4f} | eps={loss_eps_avg:.4f} | lat={loss_lat_avg:.4f} | keep={loss_keep_avg:.4f} "
+                        f"| α={cur_alpha:.3f} | cd={cur_cond_dropout_p:.2f} | holeOnly={hole_only}")
+                pbar.set_postfix_str(f"tot={train_loss_avg:.4f}")
                 pbar.write(line)
                 self.logger.info(line)
 
             if self.is_main and ((global_step % self.cfg.image_every) == 0 or global_step == 1):
                 try:
-                    self._save_preview(batch, global_step, max_rows=min(4, self.cfg.batch_size))
-                    pbar.write(f"[img] saved preview at step {global_step}")
+                    batch_vis = next(data_iter)
+                    self._save_preview(batch_vis, global_step, max_rows=min(4, self.cfg.batch_size))
+                    pbar.write(f"[img] saved preview at step {global_step}")                    
+                    
+        # -----------------------------------------------
                 except Exception as e:
                     msg = f"[warn] preview save failed: {e}"
                     pbar.write(msg); self.logger.info(msg)
@@ -1022,6 +1252,9 @@ class CatVTON_SD3_Trainer:
                     pbar.write(f"[save-epoch] {path}")
                 self._epoch_loss_sum = 0.0
                 self._epoch_loss_count = 0
+                comp_eps_sum = 0.0
+                comp_lat_sum = 0.0
+                comp_keep_sum = 0.0
                 if self.is_main:
                     pbar.set_description(f"Epoch {epoch}")
                 if self.is_dist and self.sampler is not None:
@@ -1048,9 +1281,16 @@ DEFAULTS = {
     "size_h": 512, "size_w": 384,
     "mask_based": True, "invert_mask": False,
 
-    "lr": 1e-5, "batch_size": 4, "grad_accum": 1, "max_steps": 128000,
-    "seed": 1337, "num_workers": 4, "cond_dropout_p": 0.1,
-    "mixed_precision": "fp16", "loss_sigma_weight": False,
+    "lr": 1e-5,          # transformer
+    "proj_lr": 3e-4,     # projector
+    "batch_size": 4, "grad_accum": 1, "max_steps": 128000,
+    "seed": 1337, "num_workers": 4,
+    "cond_dropout_p": 0.1,
+    "cond_dropout_warmup_steps": 2000,
+    "alpha_warmup_steps": 2000,
+    "hole_only_warmup_steps": 2000,
+    "mixed_precision": "fp16",
+    "loss_sigma_weight": False,
     "adapter_alpha": 1.0,
     "use_scaler": True,
 
@@ -1066,14 +1306,35 @@ DEFAULTS = {
 
     "preview_infer_steps": 16,
     "preview_strength": 0.6,
+    # <<< FIX: 프리뷰 스윕에 0.0 포함
+    "preview_alpha_sweep": [0.0, 0.5, 1.0],
+    "preview_use_inpaint_start": True,
+    "preview_offload_cpu" : True,
+    "preview_rows" : 4,
+    "preview_save_raw": False, 
 
     "hole_loss_weight": 2.0,
     "norm_match_adapter": True,
     "norm_match_clip": 5.0,
 
-    "keep_consistency_lambda": 0.0,   # optional identity term on Mi (0 to disable)
+    "keep_consistency_lambda": 0.0,
+    "proj_hole_gate_warmup_steps": 4000,
+
+    "latent_rec_lambda": 0.75,
+    "latent_rec_lambda_warmup_steps": 4000,
+    "preview_save_base": True,
+
     "hf_token": None,
 }
+
+def parse_float_list_csv(s: str) -> List[float]:
+    parts = re.split(r"[,\s]+", s.strip())
+    vals = []
+    for p in parts:
+        if not p:
+            continue
+        vals.append(float(p))
+    return vals
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -1087,6 +1348,7 @@ def parse_args():
     p.add_argument("--mask_free", action="store_true")
     p.add_argument("--invert_mask", action="store_true")
     p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--proj_lr", type=float, default=None)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--grad_accum", type=int, default=None)
     p.add_argument("--max_steps", type=int, default=None)
@@ -1094,6 +1356,9 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=None)
     p.add_argument("--image_every", type=int, default=None)
     p.add_argument("--cond_dropout_p", type=float, default=None)
+    p.add_argument("--cond_dropout_warmup_steps", type=int, default=None)
+    p.add_argument("--alpha_warmup_steps", type=int, default=None)
+    p.add_argument("--hole_only_warmup_steps", type=int, default=None)
     p.add_argument("--mixed_precision", type=str, default=None, choices=["fp16", "fp32", "bf16"])
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
@@ -1111,6 +1376,8 @@ def parse_args():
     p.add_argument("--preview_infer_steps", type=int, default=None)
     p.add_argument("--preview_strength", type=float, default=None)
     p.add_argument("--preview_seed", type=int, default=None)
+    p.add_argument("--preview_alpha_sweep", type=str, default=None,
+                   help="Comma/space separated list, e.g. '0.5,1.0,2.0'")
     p.add_argument("--resume_ckpt", type=str, default=None, help="path to checkpoint to resume from")
 
     # kept for compat
@@ -1120,6 +1387,9 @@ def parse_args():
 
     # new
     p.add_argument("--keep_consistency_lambda", type=float, default=None)
+    p.add_argument("--latent_rec_lambda", type=float, default=None)
+    p.add_argument("--proj_hole_gate_warmup_steps", type=int, default=None)
+    p.add_argument("--preview_use_inpaint_start", action="store_true")
 
     return p.parse_args()
 
@@ -1165,6 +1435,17 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
 
     if getattr(args, "no_norm_match_adapter", False):
         cfg["norm_match_adapter"] = False
+
+    if isinstance(cfg.get("preview_alpha_sweep"), str):
+        cfg["preview_alpha_sweep"] = parse_float_list_csv(cfg["preview_alpha_sweep"])
+    elif args.preview_alpha_sweep is not None:
+        cfg["preview_alpha_sweep"] = parse_float_list_csv(args.preview_alpha_sweep)
+
+    if getattr(args, "proj_hole_gate_warmup_steps", None) is not None:
+        cfg["proj_hole_gate_warmup_steps"] = int(args.proj_hole_gate_warmup_steps)
+
+    if getattr(args, "preview_use_inpaint_start", False):
+        cfg["preview_use_inpaint_start"] = True
 
     return DotDict(cfg)
 

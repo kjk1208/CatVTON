@@ -4,44 +4,62 @@ sd3_model: stabilityai/stable-diffusion-3.5-large
 size_h: 512
 size_w: 384
 
-mask_based: true           # Stage-1: true, Stage-2: false
-invert_mask: true          # 의류 마스크를 뒤집어 Mi: keep=1 / hole=0 로 맞춤
+mask_based: true
+invert_mask: true
 
 # training
 use_scaler: true
 disable_text: true
-lr: 1.0e-4
+lr: 3.0e-5                 # transformer (살짝 상향)
+proj_lr: 8.0e-4            # projector 전용 (조금 더 공격적)
 batch_size: 64
 grad_accum: 1
 max_steps: 256000
 cond_dropout_p: 0.1
-mixed_precision: bf16      # H100이면 bf16
+hole_only_warmup_steps: 4000      # 초반엔 완전 hole-only
+mixed_precision: bf16
 seed: 1337
 num_workers: 8
 
+
+# inpainting objective
+latent_rec_lambda: 0.15           # 마스크 평균 정규화 후엔 0.1~0.2로 시작 권장
+latent_rec_lambda_warmup_steps: 4000
+loss_sigma_weight: true
+
 # preview
-preview_infer_steps: 32
+preview_infer_steps: 60
 preview_seed: 1234
-preview_strength: 0.6
+preview_strength: 0.3
+preview_alpha_sweep: [0.0, 0.5, 1.0, 2.0]
+preview_use_inpaint_start: true    # 학습 조건과 동일 시작의 프리뷰도 저장
+preview_offload_cpu: false
+preview_rows : 4
+preview_save_raw: false
+preview_save_base : true
 
 # checkpoints & logging
-save_epoch_ckpt: 15
+save_epoch_ckpt: 15            #server
 default_resume_ckpt: None
 resume_ckpt: None
 save_root_dir: logs
 save_name: catvton_sd35_mask
 log_every: 10
-image_every: 200
+image_every: 100
 save_every: 12800
 
 # adapter / projector
-adapter_alpha: 1.0
+adapter_alpha: 0.5
 norm_match_adapter: true
-norm_match_clip: 5.0
+norm_match_clip: 10.0
+proj_hole_gate_warmup_steps: 0  # projector HOLE 게이팅 워밍업
+alpha_warmup_steps: 0
+cond_dropout_warmup_steps: 0   # 워밍업 늘림
 
 # losses
-hole_loss_weight: 2.0
-keep_consistency_lambda: 0.1   # 0.05~0.2 권장 (0이면 비활성)
+hole_loss_weight: 2.0              # ε MSE의 홀 가중은 조금 낮춰 밸런스
+keep_consistency_lambda: 0.0       # 왼쪽 전체 생성과 충돌 가능성 → 일단 끄고 시작
+garment_rec_lambda: 0.1           # 오른쪽(의류)도 원본과 동일하게 나오도록 강한 재구성 항
 
 # runtime
 hf_token: "${HUGGINGFACE_TOKEN}"
