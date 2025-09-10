@@ -27,7 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 from torchvision.utils import save_image, make_grid
 from torch.utils.tensorboard import SummaryWriter
@@ -67,6 +67,7 @@ except Exception:
 
 from huggingface_hub import snapshot_download
 from torch import amp as torch_amp
+
 
 
 # ------------------------------------------------------------
@@ -213,15 +214,25 @@ class PairListDataset(Dataset):
 # ------------------------------------------------------------
 # SD3.5 helpers
 # ------------------------------------------------------------
+# @torch.no_grad()
+# def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
+#     vdtype = next(vae.parameters()).dtype
+#     posterior = vae.encode(x_bchw.to(vdtype)).latent_dist
+#     latents = posterior.sample()
+#     sf = vae.config.scaling_factor
+#     sh = getattr(vae.config, "shift_factor", 0.0)
+#     latents = (latents - sh) * sf
+#     return latents
+
 @torch.no_grad()
-def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
+def to_latent_sd3(vae, x):
     vdtype = next(vae.parameters()).dtype
-    posterior = vae.encode(x_bchw.to(vdtype)).latent_dist
-    latents = posterior.sample()
+    posterior = vae.encode(x.to(vdtype)).latent_dist
+    latents = posterior.sample() if torch.is_grad_enabled() else posterior.mean
     sf = vae.config.scaling_factor
     sh = getattr(vae.config, "shift_factor", 0.0)
-    latents = (latents - sh) * sf
-    return latents
+    return (latents - sh) * sf
+
 
 
 @torch.no_grad()
@@ -512,27 +523,25 @@ class CatVTON_SD3_Trainer:
         self._preview_gen = torch.Generator(device=self.device).manual_seed(cfg.preview_seed)
         self._mask_keep_logged = False  # <<< FIX: 마스크 극성 빠른 점검 로그 1회용 플래그
 
-    def _encode_prompts(self, bsz: int):
-        empties = [""] * bsz
+    def _encode_prompts(self, bsz:int):
         if getattr(self.cfg, "disable_text", True):
-            if not hasattr(self, "_enc_shapes"):
-                with torch.no_grad():
-                    try:
-                        pe_probe, _, ppe_probe, _ = self.encode_prompt(
-                            prompt=[""], prompt_2=[""], prompt_3=[""],
-                            device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
-                        )
-                    except TypeError:
-                        pe_probe, _, ppe_probe, _ = self.encode_prompt(
-                            prompt=[""],
-                            device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
-                        )
-                self._pe_seq = pe_probe.shape[1]
-                self._pe_dim = pe_probe.shape[2]
-                self._ppe_dim = ppe_probe.shape[1]
-            pe  = torch.zeros((bsz, self._pe_seq,  self._pe_dim),  dtype=self.dtype, device=self.device)
-            ppe = torch.zeros((bsz, self._ppe_dim),                dtype=self.dtype, device=self.device)
-            return pe, ppe
+            # 한 번만 실제 '빈 프롬프트'를 받아 캐시
+            if not hasattr(self, "_null_pe"):
+                pe, _, ppe, _ = self.encode_prompt(
+                    prompt=[""], prompt_2=[""], prompt_3=[""],
+                    device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                )
+                self._null_pe  = pe.detach().to(self.dtype)
+                self._null_ppe = ppe.detach().to(self.dtype)
+            return (self._null_pe.expand(bsz, -1, -1).contiguous(),
+                    self._null_ppe.expand(bsz, -1).contiguous())
+        # 또는 고정 문장 사용
+        text = getattr(self.cfg, "fixed_prompt",
+                    "studio photo, front view, clean background, high quality")
+        pe, _, ppe, _ = self.encode_prompt([text]*bsz, [text]*bsz, [text]*bsz,
+                                        device=self.device, num_images_per_prompt=1,
+                                        do_classifier_free_guidance=False)
+        return pe.to(self.dtype), ppe.to(self.dtype)
 
         try:
             pe, _, ppe, _ = self.encode_prompt(
@@ -585,19 +594,16 @@ class CatVTON_SD3_Trainer:
     @torch.no_grad()
     def _preview_sample(self, batch, num_steps: int, adapter_alpha: float, global_step: int = 0):
         """
-        SD3.5 inpaint 프리뷰 (패치 버전)
-        - 시작 상태를 학습 분포와 정렬: 오른쪽 = Xi + σ·noise, 왼쪽 = σ·noise
-        - z/noise는 float32 유지, 모델 I/O만 self.dtype
-        - per-step 재합성에서도 동일 noise 사용해 KEEP 분포 고정
+        프리뷰: 오른쪽(KEEP)은 항상 Xi + σ·noise로 유지, 왼쪽(HOLE)만 생성.
         """
         H, W = self.cfg.size_h, self.cfg.size_w
         x_in = batch["x_concat_in"].to(self.device, self.dtype)
         m    = batch["m_concat"].to(self.device, self.dtype)
 
         # latents & mask
-        Xi = to_latent_sd3(self.vae, x_in).to(self.dtype)                      # [B,16,H/8,2W/8]
-        Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)  # [B,1,h,w]
-        K  = Mi.float()
+        Xi = to_latent_sd3(self.vae, x_in).to(self.dtype)
+        Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
+        K  = Mi.float()          # KEEP
         Hmask = 1.0 - K
         B = Xi.shape[0]
 
@@ -613,14 +619,10 @@ class CatVTON_SD3_Trainer:
 
         # float32 noise / state
         noise = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=self._preview_gen)
-
         sigma0 = sigmas[0].to(Xi.device, torch.float32)
 
-        # 시작 상태: z = σ·noise + (오른쪽만) Xi
-        mid = Xi.shape[-1] // 2
-        K_right_lat = torch.zeros_like(Mi)
-        K_right_lat[..., :, :, mid:] = 1.0
-        z = (sigma0 * noise + K_right_lat * Xi.float()).to(torch.float32)      # z는 끝까지 float32
+        # 시작: KEEP=Xi+σ·noise, HOLE=σ·noise
+        z = (K * (Xi.float() + sigma0 * noise) + (1.0 - K) * (sigma0 * noise)).float()
 
         # prompt
         prompt_embeds, pooled = self._encode_prompts(B)
@@ -641,17 +643,12 @@ class CatVTON_SD3_Trainer:
                     z_in = self._fm_scale(z, sigma_t_b)
                 z_in_f32 = z_in.float()
 
-                # 33ch concat → projector (fp32)
+                # 33ch concat → projector (fp32) — HOLE만 주입
                 hidden_cat = torch.cat([z_in_f32, Xi.float(), Mi.float()], dim=1)
                 hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
-
                 with torch.amp.autocast(device_type='cuda', enabled=False):
                     proj = proj_net(hidden_cat).float()
-
-                # 게이팅 워밍업 동안 HOLE만
-                gate_steps = int(self.cfg.get("proj_hole_gate_warmup_steps", 4000))
-                if global_step < gate_steps:
-                    proj = proj * Hmask
+                proj = proj * Hmask
 
                 # norm match
                 if self.cfg.norm_match_adapter:
@@ -660,7 +657,7 @@ class CatVTON_SD3_Trainer:
                             (proj.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
                     proj = proj * scale.clamp(0.0, float(self.cfg.norm_match_clip))
 
-                # 모델 입력만 self.dtype
+                # 모델 입력
                 hidden_in = (z_in_f32 + float(adapter_alpha) * proj).to(self.dtype)
 
                 with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):
@@ -670,25 +667,24 @@ class CatVTON_SD3_Trainer:
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled,
                         return_dict=True,
-                    ).sample.float()  # 다시 float32
+                    ).sample.float()
 
-                # FM Euler step (z는 float32 유지)
+                # Euler step
                 z = sched.step(eps_pred, sigma_t, z).prev_sample.float()
 
-                # per-step 재합성: 오른쪽은 Xi + σ_next·noise 유지
+                # per-step 재합성: KEEP은 계속 고정
                 sigma_next = sigmas[i + 1].to(Xi.device, torch.float32)
-                z_keep = Xi.float() + sigma_next * noise
-                z = (K_right_lat * z_keep + (1.0 - K_right_lat) * z).float()
+                z = (K * (Xi.float() + sigma_next * noise) + (1.0 - K) * z).float()
 
-            # decode & 최종 합성(오른쪽은 입력 복사)
+            # decode & 최종 합성(오른쪽 입력 복사)
             x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
-            K3_right = torch.zeros_like(m).repeat(1, 3, 1, 1)
-            K3_right[..., :, :, x_hat.shape[-1] // 2:] = 1.0
-            x_final = K3_right * x_in + (1.0 - K3_right) * x_hat
+            K3_keep = m.repeat(1, 3, 1, 1)
+            x_final = K3_keep * x_in + (1.0 - K3_keep) * x_hat
             return torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
         finally:
             if was_train:
                 self.transformer.train()
+
 
 
 
@@ -771,13 +767,15 @@ class CatVTON_SD3_Trainer:
         eps   = torch.randn(z0.shape, device=z0.device, dtype=z0.dtype)        
         x_t   = Mi*(Xi + sigma*eps) + (1.0 - Mi)*(z0 + sigma*eps)
 
-        try:   z_in = self.train_scheduler.scale_model_input(x_t, sigma.view(B))
+        try:    z_in = self.train_scheduler.scale_model_input(x_t, sigma.view(B))
         except: z_in = self._fm_scale(x_t, sigma.view(B))
 
         hidden_cat = torch.cat([z_in.float(), Xi.float(), Mi.float()], dim=1)
         hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
         with torch.amp.autocast(device_type='cuda', enabled=False):
             pj = (self.projector.module if isinstance(self.projector, DDP) else self.projector)(hidden_cat).float()
+        Hmask = 1.0 - Mi
+        pj = pj * Hmask
         hidden_in = (z_in.float() + float(self.adapter_alpha)*pj).to(self.dtype)
 
         prompt_embeds, pooled = self._encode_prompts(B)
@@ -790,7 +788,174 @@ class CatVTON_SD3_Trainer:
         z0_hat = x_t - sigma*eps_pred
         return torch.clamp((from_latent_sd3(self.vae, z0_hat.to(self.dtype)) + 1.0)*0.5, 0.0, 1.0).detach().cpu()
     
-    
+    @torch.no_grad()
+    def infer_tryon_once(
+        self,
+        x_in: torch.Tensor,   # [B,3,H,2W]
+        m: torch.Tensor,      # [B,1,H,2W]  (Mi=1 KEEP, Mi=0 HOLE)
+        steps: int = 40,
+        alpha: float = 0.8,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        device = self.device
+        H, W = self.cfg.size_h, self.cfg.size_w
+
+        # latents / mask
+        Xi = to_latent_sd3(self.vae, x_in.to(self.dtype)).float()
+        Mi = F.interpolate(m.to(self.dtype), size=(H // 8, (2 * W) // 8), mode="nearest").float()
+        K = Mi.float()
+        Hmask = 1.0 - K
+        B = Xi.shape[0]
+
+        # scheduler/sigmas
+        sched = FM.from_config(self.scheduler.config)
+        sigmas_full = self._ensure_fm_sigmas(sched, max(2, int(steps)))
+        s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
+        start_idx = min(int(s * (sigmas_full.numel() - 1)), sigmas_full.numel() - 2)
+        sigmas = sigmas_full[start_idx:].contiguous()
+        if sigmas[-1] != 0:
+            sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
+        try:
+            sched.sigmas = sigmas.clone()
+            sched.timesteps = sigmas.clone()
+        except Exception:
+            pass
+
+        # init
+        gen = (torch.Generator(device=device).manual_seed(int(seed))
+            if seed is not None else self._preview_gen)
+        noise = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=gen)
+        s0 = sigmas[0].to(Xi)
+        z = (K * (Xi + s0 * noise) + (1.0 - K) * (s0 * noise)).float()
+
+        # prompts
+        prompt_embeds, pooled = self._encode_prompts(B)
+        model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+        proj_net = self.projector.module if isinstance(self.projector, DDP) else self.projector
+
+        was_train = model.training
+        model.eval()
+        try:
+            for i in range(sigmas.numel() - 1):
+                sigma_t = sigmas[i].to(Xi)
+                sigma_t_b = sigma_t.expand(B)
+
+                try:
+                    z_in = sched.scale_model_input(z, sigma_t_b)
+                except Exception:
+                    z_in = self._fm_scale(z, sigma_t_b)
+                z_in_f32 = z_in.float()
+
+                # 33ch concat → projector (HOLE만)
+                hidden_cat = torch.cat([z_in_f32, Xi.float(), Mi.float()], dim=1)
+                hidden_cat = torch.nan_to_num(hidden_cat, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    proj = proj_net(hidden_cat).float()
+                proj = proj * Hmask
+
+                if self.cfg.norm_match_adapter:
+                    eps = 1e-6
+                    scale = (z_in_f32.flatten(1).norm(dim=1, keepdim=True) /
+                            (proj.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B, 1, 1, 1)
+                    proj = proj * scale.clamp(0.0, float(self.cfg.norm_match_clip))
+
+                hidden_in = (z_in_f32 + float(alpha) * proj).to(self.dtype)
+
+                with torch.amp.autocast(device_type="cuda", dtype=self.dtype, enabled=(device.type == "cuda")):
+                    eps_pred = model(
+                        hidden_states=hidden_in,
+                        timestep=sigma_t_b,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled,
+                        return_dict=True,
+                    ).sample.float()
+
+                z = sched.step(eps_pred, sigma_t, z).prev_sample.float()
+
+                # 오른쪽 재합성(KEEP 고정)
+                sigma_next = sigmas[i + 1].to(Xi)
+                z = (K * (Xi + sigma_next * noise) + (1.0 - K) * z).float()
+
+            x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
+            K3_keep = m.repeat(1, 3, 1, 1)
+            x_final = K3_keep * x_in + (1.0 - K3_keep) * x_hat
+            return torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+        finally:
+            if was_train:
+                model.train()
+
+
+    @torch.no_grad()
+    def _bottom_caption_row(self, names: List[str], widths: List[int],
+                            height: int = 28, scale: float = 10.0,
+                            bg: float = 1.0, fg: float = 0.0) -> torch.Tensor:
+        """
+        패널 가장 아래에 한 번만 붙일 전체 폭 캡션 스트립을 생성.
+        - names: 각 열 이름
+        - widths: 각 열의 pixel 폭(열별 W). sum(widths) == 전체 패널 폭
+        - height: 기본 높이
+        - scale: 글자/스트립 크기 배수 (10.0 = 10배)
+        반환: [1,3,H,W] (0..1, CPU)
+        """
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+
+        W_total = int(sum(map(int, widths)))
+        H = int(height * scale)
+
+        bg255 = int(bg * 255); fg255 = int(fg * 255)
+        img = Image.new("RGB", (W_total, H), (bg255, bg255, bg255))
+        draw = ImageDraw.Draw(img)
+
+        # 큰 글꼴 시도(있으면 DejaVu, 없으면 기본 글꼴 + 자동 스케일)
+        font = None
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", size=int(H * 0.7))
+        except Exception:
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+
+        x0 = 0
+        for name, w in zip(names, widths):
+            w = int(w)
+            try:
+                bbox = draw.textbbox((0, 0), name, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            except Exception:
+                tw, th = draw.textsize(name, font=font)
+
+            # 각 열 폭의 가운데 정렬
+            x = x0 + max(0, (w - tw) // 2)
+            y = max(0, (H - th) // 2)
+            draw.text((x, y), name, fill=(fg255, fg255, fg255), font=font)
+            x0 += w
+
+        t = torch.from_numpy(np.array(img, dtype=np.uint8)).permute(2, 0, 1).float() / 255.0  # [3,H,W]
+        return t.unsqueeze(0)  # [1,3,H,W]
+
+
+    @torch.no_grad()
+    def run_infer_once(
+        self,
+        x_in: torch.Tensor,      # [B,3,H,2W]
+        m: torch.Tensor,         # [B,1,H,2W]
+        out_path: str,
+        steps: int = 60,
+        alpha: float = 0.8,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        infer_tryon_once를 호출해 파일로도 저장하는 래퍼.
+        """
+        img = self.infer_tryon_once(x_in, m, steps=steps, alpha=alpha, seed=seed)
+        save_image(make_grid(img, nrow=1), out_path)
+        if hasattr(self, "logger"):
+            self.logger.info(f"[infer] saved inference to {out_path}")
+        return img
+
+
     @torch.no_grad()
     def _save_preview(self, batch: Dict[str, torch.Tensor], global_step: int, max_rows: int = 4):
         """
@@ -829,20 +994,24 @@ class CatVTON_SD3_Trainer:
             "m_concat": m,
         }
 
-        # alpha 스윕 프리뷰
         alphas: List[float] = list(self.cfg.get("preview_alpha_sweep", [self.adapter_alpha])) or [self.adapter_alpha]
         for a in alphas:
-            # (1) inpaint 프리뷰
+            # ---- (0) 태그를 먼저 준비 ----
+            a_tag = f"{float(a):.1f}".replace(".", "_")
+
+            # ---- (1) inpaint 프리뷰 ----
             pred_img_final = self._preview_sample(
                 mini, num_steps=num_steps, adapter_alpha=float(a), global_step=global_step
             )
 
-            # (2) one-step teacher-forcing 복원 — 인라인 블록을 함수 호출로 치환
+            # ---- (2) 1-step teacher forcing ----
             one_step_img = self.one_step_teacher_forcing(x_in, x_gt, m)
 
-            # 패널 합치기
+            # ---- (4) 패널 구성 ----
             _, _, Hh, WW = x_gt.shape
             Ww = WW // 2
+            B = x_gt.shape[0]
+
             person        = x_gt[:, :, :, :Ww]
             garment       = x_gt[:, :, :, Ww:]
             mask_keep     = m[:, :, :, :Ww]
@@ -851,28 +1020,42 @@ class CatVTON_SD3_Trainer:
 
             def _cpu32(t): return t.detach().to('cpu', dtype=torch.float32, non_blocking=True).contiguous()
 
-            tiles = [
-                _cpu32(self._denorm(person)),
-                _cpu32(mask_vis),
-                _cpu32(self._denorm(masked_person)),
-                _cpu32(self._denorm(garment)),
-                xi_noisy_img,                    # 이미 CPU
-                _cpu32(self._denorm(x_gt)),
-                pred_img_final,                  # 이미 CPU (아래 2) 참고)
-                one_step_img,                    # 이미 CPU (아래 2) 참고)
+            # (4-1) 타일과 라벨 이름 정의
+            tiles_and_names = [
+                (_cpu32(self._denorm(person))   , "person"),
+                (_cpu32(mask_vis)               , "mask_vis"),
+                (_cpu32(self._denorm(masked_person)), "masked_person"),
+                (_cpu32(self._denorm(garment))  , "garment"),
+                (xi_noisy_img                   , "Xi + noise"),
+                (_cpu32(self._denorm(x_gt))     , "GT pair"),
+                (pred_img_final                 , f"preview α={float(a):.1f}"),
+                (one_step_img                   , "1-step TF"),
             ]
-            panel = torch.cat(tiles, dim=3)
-            grid  = make_grid(panel, nrow=1)
-            a_tag = f"{float(a):.1f}".replace(".", "_")
-            out_path = os.path.join(self.img_dir, f"step_{global_step:06d}_alpha_{a_tag}.png")
-            save_image(grid, out_path)
-            self.logger.info(f"[img] saved preview at step {global_step} (alpha={a}): {out_path}")
 
-        # >>> 베이스 파이프라인 스모크 테스트 저장도 여기서
-        if self.cfg.get("preview_save_base", True):
-            base = self.smoke_test_base_sampler(mini, num_steps=self.cfg.preview_infer_steps)
-            save_image(make_grid(base, nrow=1),
-                    os.path.join(self.img_dir, f"step_{global_step:06d}_BASE.png"))
+            # (4-2) per-tile 캡션 제거: 그냥 열들만 가로 concat
+            cols = [t for (t, _) in tiles_and_names]
+            panel_bchw = torch.cat(cols, dim=3)                      # [B,3,H, sumW]
+            col_widths = [int(t.shape[-1]) for (t, _) in tiles_and_names]
+            col_names  = [name for (_, name) in tiles_and_names]
+
+            # (4-3) 배치 전체를 세로로 쌓은 단일 이미지
+            grid = make_grid(panel_bchw, nrow=1, padding=0)  # 패딩 제거. [3, B*H, sumW]  ← 한 장
+
+            # (4-4) 맨 아래에 열 이름을 '한 번만' 큰 글씨로 붙임
+            caption_h = int(self.cfg.get("preview_caption_h", 28))
+            bottom = self._bottom_caption_row(
+                names=col_names,
+                widths=col_widths,
+                height=caption_h,
+                scale=2.5,   # 글자 크기
+                bg=1.0, fg=0.0
+            )[0]                                                    # [3,Hc,sumW]
+
+            final_img = torch.cat([grid, bottom], dim=1)            # 세로 이어붙이기 (H축)
+
+            out_path = os.path.join(self.img_dir, f"step_{global_step:06d}_alpha_{a_tag}.png")
+            save_image(final_img, out_path)
+            self.logger.info(f"[img] saved preview at step {global_step} (alpha={a}): {out_path}")
 
 
     # ------ training core ------
@@ -889,8 +1072,84 @@ class CatVTON_SD3_Trainer:
         u = torch.rand(B, device=device)
         return sigma_min * (sigma_max / sigma_min) ** u
 
+    def _set_phase(self, phase: str):
+        assert phase in ("proj_only", "base_only")
+        if getattr(self, "_curr_phase", None) == phase:
+            return
+
+        if phase == "proj_only":
+            # transformer 전부 동결
+            tf = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+            for p in tf.parameters():
+                p.requires_grad = False
+            # projector 학습 on
+            pj = self.projector.module if isinstance(self.projector, DDP) else self.projector
+            for p in pj.parameters():
+                p.requires_grad = True
+
+            # optimizer 재빌드 (projector만)
+            pj_params = [p for p in self.projector.parameters() if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(
+                [{"params": pj_params, "lr": float(self.cfg.get("proj_lr", 1e-3))}],
+                betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+            )
+
+            # sanity check
+            tf_train = sum(p.numel() for p in tf.parameters() if p.requires_grad)
+            pj_train = sum(p.numel() for p in pj.parameters() if p.requires_grad)
+            if tf_train != 0:
+                raise RuntimeError(f"[phase=proj_only] transformer still trainable params={tf_train}")
+            if self.is_main:
+                self.logger.info(f"[phase] switched to proj_only (proj_trainable={pj_train/1e6:.3f}M)")
+
+        else:  # base_only
+            pj = self.projector.module if isinstance(self.projector, DDP) else self.projector
+            for p in pj.parameters():
+                p.requires_grad = False
+
+            tf = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+            for p in tf.parameters():
+                p.requires_grad = False
+            _ = freeze_all_but_self_attn_qkv(tf)
+
+            tf_params = [p for p in self.transformer.parameters() if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(
+                [{"params": tf_params, "lr": float(self.cfg.get("lr", 1e-5))}],
+                betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
+            )
+
+            tf_train = sum(p.numel() for p in tf.parameters() if p.requires_grad)
+            pj_train = sum(p.numel() for p in pj.parameters() if p.requires_grad)
+            if pj_train != 0:
+                raise RuntimeError(f"[phase=base_only] projector still trainable params={pj_train}")
+            if self.is_main:
+                self.logger.info(f"[phase] switched to base_only (tf_trainable={tf_train/1e6:.3f}M)")
+
+        self._curr_phase = phase
+
+
+    def _compute_adapter_alpha(self, global_step: int) -> float:
+        max_a = float(self.adapter_alpha)
+
+        if getattr(self, "_curr_phase", None) == "proj_only":
+            a0 = float(self.cfg.get("alpha_proj_only_start", 0.3))
+            warm = int(self.cfg.get("alpha_proj_only_warmup_steps", 300))
+            if warm <= 0:
+                return max_a
+            t = min(1.0, (global_step + 1) / float(warm))
+            return a0 + (max_a - a0) * t
+
+        # base_only
+        warm = int(self.cfg.get("alpha_warmup_steps", 2000))
+        if warm <= 0:
+            return max_a
+        t = min(1.0, (global_step + 1) / float(warm))
+        return max_a * t
+
+
+
     def step(self, batch, global_step: int, cur_alpha: float,
-             cur_cond_dropout_p: float, hole_only: bool):
+         cur_cond_dropout_p: float, hole_only: bool):
         H, W = self.cfg.size_h, self.cfg.size_w
 
         x_concat_in = batch["x_concat_in"].to(self.device, self.dtype)
@@ -910,26 +1169,25 @@ class CatVTON_SD3_Trainer:
             Xi = Xi * (1.0 - drop)
             Mi = Mi * (1.0 - drop)
 
+        # K=KEEP(=Mi), Hmask=HOLE
         K = Mi.float()
         Hmask = 1.0 - K
 
         # sample sigma
         sigmas = self._sample_sigmas(self.train_scheduler, B)
 
-        # inpainting forward
+        # inpainting forward (KEEP=Xi, HOLE=z0)
         z0_f32     = z0.float()
         Xi_f32     = Xi.float()
-        noise_f32 = torch.randn(z0_f32.shape, device=z0_f32.device, dtype=z0_f32.dtype)                 # ε
+        noise_f32  = torch.randn(z0_f32.shape, device=z0_f32.device, dtype=z0_f32.dtype)  # ε
         sigma_b11  = sigmas.view(B, 1, 1, 1).to(dtype=torch.float32)
         z0_noisy   = z0_f32 + sigma_b11 * noise_f32
         Xi_noisy   = Xi_f32 + sigma_b11 * noise_f32
-
-        # 혼합: KEEP=입력, HOLE=정답
         x_t_mixed  = K * Xi_noisy + Hmask * z0_noisy
 
         target_f32 = noise_f32  # ε-target
 
-        # <<< FIX: 프리컨디셔닝을 스케줄러 함수로 통일
+        # preconditioning
         try:
             z_in = self.train_scheduler.scale_model_input(x_t_mixed, sigmas)
         except Exception:
@@ -946,13 +1204,11 @@ class CatVTON_SD3_Trainer:
         if self.cfg.norm_match_adapter:
             eps = 1e-6
             s = (z_in.float().flatten(1).norm(dim=1, keepdim=True) /
-                 (proj_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
+                (proj_f32.flatten(1).norm(dim=1, keepdim=True) + eps)).view(B,1,1,1)
             proj_f32 = proj_f32 * s.clamp(0.0, float(self.cfg.norm_match_clip))
 
-        # projector HOLE-gate warmup
-        gate_steps = int(self.cfg.get("proj_hole_gate_warmup_steps", 4000))
-        if global_step < gate_steps:
-            proj_f32 = proj_f32 * Hmask
+        # projector는 항상 HOLE만 주입
+        proj_f32 = proj_f32 * Hmask
 
         hidden_in = (z_in.float() + float(cur_alpha) * proj_f32).to(self.dtype)
 
@@ -970,50 +1226,85 @@ class CatVTON_SD3_Trainer:
 
         eps_pred_f32 = eps_pred.float()
 
-        # --------- Losses ---------
-        hole = Hmask
-        Wlat = Mi.shape[-1]
-        Lmask = torch.zeros_like(Mi); Lmask[..., :, :, : Wlat//2] = 1.0
-        Rmask = 1.0 - Lmask
-
-        # (1) ε-MSE
-        if hole_only:
-            wmap_eps = hole
-        else:
-            wmap_eps = 1.0 + float(self.cfg.hole_loss_weight) * hole
-
+        # --------- Base losses ---------
+        # ε-MSE: HOLE만
         if bool(self.cfg.get("loss_sigma_weight", False)):
             sigma_w = 1.0 / (sigma_b11 ** 2 + 1.0)
-            loss_eps = torch.mean(((eps_pred_f32 - target_f32) ** 2) * wmap_eps * sigma_w)
+            loss_eps = torch.mean(((eps_pred_f32 - target_f32) ** 2) * Hmask * sigma_w)
         else:
-            loss_eps = torch.mean(((eps_pred_f32 - target_f32) ** 2) * wmap_eps)
+            loss_eps = torch.mean(((eps_pred_f32 - target_f32) ** 2) * Hmask)
 
-        # (2) latent x0 재구성
+        # latent x0 재구성: HOLE만
         z0_hat = x_t_mixed.float() - sigma_b11 * eps_pred_f32
-        lat_mask = Lmask
-        loss_lat = ((z0_hat - z0_f32) ** 2 * lat_mask).sum() / lat_mask.sum().clamp_min(1.0)
-
+        loss_lat = ((z0_hat - z0_f32) ** 2 * Hmask).sum() / Hmask.sum().clamp_min(1.0)
         rec_lambda = float(self.cfg.latent_rec_lambda)
         warmup_steps = int(getattr(self.cfg, "latent_rec_lambda_warmup_steps", 0))
         if warmup_steps > 0 and global_step < warmup_steps:
             rec_lambda = 0.0
 
-        # (3) KEEP consistency (옵션)
+        # KEEP consistency (옵션)
         keep_lambda = float(self.cfg.get("keep_consistency_lambda", 0.0))
         loss_keep = torch.tensor(0.0, device=self.device)
         if keep_lambda > 0.0:
             loss_keep = torch.mean(((z0_hat - z0_f32) ** 2) * K)
 
-        # (2-추가) 오른쪽(의류) 재구성
-        gar_lambda = float(self.cfg.get("garment_rec_lambda", 1.0))
-        loss_gar = (((z0_hat - z0_f32) ** 2) * Rmask).sum() / Rmask.sum().clamp_min(1.0)
+        # Garment recon (옵션)
+        gar_lambda = float(self.cfg.get("garment_rec_lambda", 0.0))
+        if gar_lambda > 0.0:
+            Wlat = Mi.shape[-1]
+            Rmask = torch.zeros_like(Mi); Rmask[..., :, :, Wlat//2:] = 1.0
+            loss_gar = (((z0_hat - z0_f32) ** 2) * Rmask).sum() / Rmask.sum().clamp_min(1.0)
+        else:
+            loss_gar = torch.tensor(0.0, device=self.device)
 
-        loss_total = loss_eps + rec_lambda * loss_lat + gar_lambda * loss_gar + keep_lambda * loss_keep
+        # --------- Projector-specific regularizers ---------
+        # (1) 출력 L2 에너지(옵션)
+        proj_out_l2_lambda = float(self.cfg.get("proj_out_l2_lambda", 0.0))
+        loss_proj_l2 = torch.tensor(0.0, device=self.device)
+        if proj_out_l2_lambda > 0.0:
+            loss_proj_l2 = (proj_f32.pow(2) * Hmask).mean()
+
+        # (2) 마진 향상(옵션, transformer 1회 추가 추론)
+        proj_margin_lambda = float(self.cfg.get("proj_margin_lambda", 0.0))
+        proj_margin = float(self.cfg.get("proj_margin", 0.0))
+        loss_margin = torch.tensor(0.0, device=self.device)
+        if proj_margin_lambda > 0.0:
+            with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
+                eps_base = model(
+                    hidden_states=z_in.to(self.dtype),   # projector 미적용 경로
+                    timestep=sigmas,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
+                    return_dict=True,
+                ).sample.float().detach()  # 베이스는 detatch
+            mse_proj = ((eps_pred_f32 - target_f32) ** 2 * Hmask).mean()
+            mse_base = ((eps_base      - target_f32) ** 2 * Hmask).mean()
+            loss_margin = torch.clamp(mse_proj - mse_base + proj_margin, min=0.0)
+
+        # --------- Total ---------
+        loss_total = (
+            loss_eps
+            + rec_lambda * loss_lat
+            + gar_lambda * loss_gar
+            + keep_lambda * loss_keep
+            + proj_out_l2_lambda * loss_proj_l2
+            + proj_margin_lambda * loss_margin
+        )
 
         if not torch.isfinite(loss_total) or not loss_total.requires_grad:
             return None
 
-        return loss_total, float(loss_eps.detach().cpu()), float(loss_lat.detach().cpu()), float(loss_keep.detach().cpu())
+        # 새 항들도 반환해서 로그 가능하게
+        return (
+            loss_total,
+            float(loss_eps.detach().cpu()),
+            float(loss_lat.detach().cpu()),
+            float(loss_keep.detach().cpu()),
+            float(loss_proj_l2.detach().cpu()),
+            float(loss_margin.detach().cpu()),
+        )
+
+
 
 
     def _save_ckpt(self, epoch: int, train_loss_epoch: float, global_step: int) -> str:
@@ -1095,6 +1386,13 @@ class CatVTON_SD3_Trainer:
         if self._loaded_cuda_rng is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(self._loaded_cuda_rng)
 
+        # 단계1(projector만) → 단계2(base만)
+        proj_first_steps = int(getattr(self.cfg, "proj_first_steps", 0))
+        if proj_first_steps > 0 and global_step < proj_first_steps:
+            self._set_phase("proj_only")
+        else:
+            self._set_phase("base_only")
+
         data_iter = itertools.cycle(self.loader)
 
         pbar = tqdm(
@@ -1109,25 +1407,29 @@ class CatVTON_SD3_Trainer:
         if self.is_dist and self.sampler is not None:
             self.sampler.set_epoch(epoch)
 
-        # rolling meters for per-step component losses
+        # rolling meters
         comp_eps_sum = 0.0
         comp_lat_sum = 0.0
         comp_keep_sum = 0.0
+        comp_proj_l2_sum = 0.0
+        comp_margin_sum = 0.0
 
         while global_step < self.cfg.max_steps:
+            if proj_first_steps > 0 and global_step == proj_first_steps:
+                self._set_phase("base_only")
+
             self.optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
             comp_eps_accum = 0.0
             comp_lat_accum = 0.0
             comp_keep_accum = 0.0
+            comp_proj_l2_accum = 0.0
+            comp_margin_accum = 0.0
             nonfinite = False
             reason = ""
 
             # ----- schedules -----
-            alpha_warm = 1.0 if self.cfg.alpha_warmup_steps <= 0 else min(
-                1.0, (global_step + 1) / float(self.cfg.alpha_warmup_steps)
-            )
-            cur_alpha = float(self.adapter_alpha) * alpha_warm
+            cur_alpha = self._compute_adapter_alpha(global_step)
 
             if global_step < int(self.cfg.cond_dropout_warmup_steps):
                 cur_cond_dropout_p = 0.0
@@ -1143,7 +1445,8 @@ class CatVTON_SD3_Trainer:
                 if (out is None):
                     nonfinite = True; reason = "None/NaN in forward"; break
 
-                loss, loss_eps_val, loss_lat_val, loss_keep_val = out
+                (loss, loss_eps_val, loss_lat_val, loss_keep_val,
+                loss_proj_l2_val, loss_margin_val) = out
 
                 if (not torch.isfinite(loss)) or (not loss.requires_grad):
                     nonfinite = True
@@ -1158,6 +1461,8 @@ class CatVTON_SD3_Trainer:
                 comp_eps_accum += float(loss_eps_val)
                 comp_lat_accum += float(loss_lat_val)
                 comp_keep_accum += float(loss_keep_val)
+                comp_proj_l2_accum += float(loss_proj_l2_val)
+                comp_margin_accum += float(loss_margin_val)
 
             if nonfinite:
                 msg = f"[warn] skipping step {global_step}: {reason}."
@@ -1209,27 +1514,35 @@ class CatVTON_SD3_Trainer:
             comp_eps_sum += comp_eps_accum / max(1, self.cfg.grad_accum)
             comp_lat_sum += comp_lat_accum / max(1, self.cfg.grad_accum)
             comp_keep_sum += comp_keep_accum / max(1, self.cfg.grad_accum)
+            comp_proj_l2_sum += comp_proj_l2_accum / max(1, self.cfg.grad_accum)
+            comp_margin_sum += comp_margin_accum / max(1, self.cfg.grad_accum)
 
             train_loss_avg = self._epoch_loss_sum / max(1, self._epoch_loss_count)
             loss_eps_avg   = comp_eps_sum / max(1, self._epoch_loss_count)
             loss_lat_avg   = comp_lat_sum / max(1, self._epoch_loss_count)
             loss_keep_avg  = comp_keep_sum / max(1, self._epoch_loss_count)
+            loss_l2_avg    = comp_proj_l2_sum / max(1, self._epoch_loss_count)
+            loss_margin_avg= comp_margin_sum / max(1, self._epoch_loss_count)
 
             if self.is_main and ((global_step % self.cfg.log_every) == 0 or global_step == 1):
                 self.tb.add_scalar("train/loss_total", train_loss_avg, global_step)
                 self.tb.add_scalar("train/loss_eps",   loss_eps_avg,   global_step)
                 self.tb.add_scalar("train/loss_lat",   loss_lat_avg,   global_step)
                 self.tb.add_scalar("train/loss_keep",  loss_keep_avg,  global_step)
+                self.tb.add_scalar("train/loss_proj_l2", loss_l2_avg, global_step)
+                self.tb.add_scalar("train/loss_proj_margin", loss_margin_avg, global_step)
                 self.tb.add_scalar("train/alpha", cur_alpha, global_step)
                 self.tb.add_scalar("train/cond_dropout_p", cur_cond_dropout_p, global_step)
                 self.tb.add_scalar("train/hole_only", float(hole_only), global_step)
+                self.tb.add_scalar("train/phase_proj_only", float(self._curr_phase == "proj_only"), global_step)
                 self.tb.add_scalar("train/grad_norm_transformer", tf_grad_norm, global_step)
-                self.tb.add_scalar("train/grad_norm_projector",  pj_grad_norm, global_step)
+                self.tb.add_scalar("train/grad_norm_projector",  pj_grad_norm,  global_step)
                 prog = (global_step % self.steps_per_epoch) / self.steps_per_epoch if self.steps_per_epoch > 0 else 0.0
                 pct = int(prog * 100)
                 line = (f"Epoch {epoch}: {pct:3d}% | step {global_step}/{self.cfg.max_steps} "
                         f"| total={train_loss_avg:.4f} | eps={loss_eps_avg:.4f} | lat={loss_lat_avg:.4f} | keep={loss_keep_avg:.4f} "
-                        f"| α={cur_alpha:.3f} | cd={cur_cond_dropout_p:.2f} | holeOnly={hole_only}")
+                        f"| l2={loss_l2_avg:.5f} | mar={loss_margin_avg:.5f} "
+                        f"| α={cur_alpha:.3f} | cd={cur_cond_dropout_p:.2f} | holeOnly={hole_only} | phase={self._curr_phase}")
                 pbar.set_postfix_str(f"tot={train_loss_avg:.4f}")
                 pbar.write(line)
                 self.logger.info(line)
@@ -1238,9 +1551,7 @@ class CatVTON_SD3_Trainer:
                 try:
                     batch_vis = next(data_iter)
                     self._save_preview(batch_vis, global_step, max_rows=min(4, self.cfg.batch_size))
-                    pbar.write(f"[img] saved preview at step {global_step}")                    
-                    
-        # -----------------------------------------------
+                    pbar.write(f"[img] saved preview at step {global_step}")
                 except Exception as e:
                     msg = f"[warn] preview save failed: {e}"
                     pbar.write(msg); self.logger.info(msg)
@@ -1255,6 +1566,8 @@ class CatVTON_SD3_Trainer:
                 comp_eps_sum = 0.0
                 comp_lat_sum = 0.0
                 comp_keep_sum = 0.0
+                comp_proj_l2_sum = 0.0
+                comp_margin_sum = 0.0
                 if self.is_main:
                     pbar.set_description(f"Epoch {epoch}")
                 if self.is_dist and self.sampler is not None:
@@ -1270,6 +1583,8 @@ class CatVTON_SD3_Trainer:
         self.logger.info("[done] training finished")
         if self.is_dist:
             dist.barrier()
+
+
 
 
 # ------------------------------------------------------------

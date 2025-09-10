@@ -10,13 +10,12 @@ invert_mask: true
 # training
 use_scaler: true
 disable_text: true
-lr: 3.0e-5                 # transformer (살짝 상향)
-proj_lr: 8.0e-4            # projector 전용 (조금 더 공격적)
-batch_size: 64
+lr: 5.0e-5                      # transformer (살짝 상향)
+proj_lr: 1.0e-4                 # projector 전용 (조금 더 공격적)
+batch_size: 6                   # server 20250910
 grad_accum: 1
 max_steps: 256000
 cond_dropout_p: 0.1
-hole_only_warmup_steps: 4000      # 초반엔 완전 hole-only
 mixed_precision: bf16
 seed: 1337
 num_workers: 8
@@ -39,7 +38,7 @@ preview_save_raw: false
 preview_save_base : true
 
 # checkpoints & logging
-save_epoch_ckpt: 15            #server
+save_epoch_ckpt: 25            #server
 default_resume_ckpt: None
 resume_ckpt: None
 save_root_dir: logs
@@ -52,14 +51,25 @@ save_every: 12800
 adapter_alpha: 0.5
 norm_match_adapter: true
 norm_match_clip: 10.0
-proj_hole_gate_warmup_steps: 0  # projector HOLE 게이팅 워밍업
-alpha_warmup_steps: 0
-cond_dropout_warmup_steps: 0   # 워밍업 늘림
+proj_hole_gate_warmup_steps: 4000  # projector HOLE 게이팅 워밍업
+alpha_warmup_steps: 4000
+cond_dropout_warmup_steps: 4000   # 워밍업 늘림
 
-# losses
-hole_loss_weight: 2.0              # ε MSE의 홀 가중은 조금 낮춰 밸런스
+# train phase
+proj_first_steps: 4000
+
+# delete
+hole_only_warmup_steps: 0         # hole-only를 안써서 0으로 설정해서 아에 안쓰게 함 20250910
+hole_loss_weight: 0               # ε MSE의 홀 가중은 이제 원래 hole만 보기 때문에 0으로 설정함 20250910
 keep_consistency_lambda: 0.0       # 왼쪽 전체 생성과 충돌 가능성 → 일단 끄고 시작
-garment_rec_lambda: 0.1           # 오른쪽(의류)도 원본과 동일하게 나오도록 강한 재구성 항
+garment_rec_lambda: 0.0           # 오른쪽(의류)도 원본과 동일하게 나오도록 강한 재구성 항
+
+#projector loss
+proj_out_l2_lambda: 1e-4   # projector 출력 에너지 규제(권장: 1e-4 ~ 5e-4)
+proj_margin_lambda: 0.0    # 켜면 transformer 1회 추가 호출 생김
+proj_margin: 0.0
+alpha_proj_only_start: 0.3            # 아래 2번에서 설명
+alpha_proj_only_warmup_steps: 300
 
 # runtime
 hf_token: "${HUGGINGFACE_TOKEN}"
