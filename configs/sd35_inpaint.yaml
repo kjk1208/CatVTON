@@ -1,0 +1,44 @@
+list_file: DATA/VITON-HD/vitonhd_train_mask.csv
+sd3_model: stabilityai/stable-diffusion-3.5-large
+
+size_h: 512
+size_w: 384
+
+mask_based: true
+invert_mask: true
+
+# training
+lr: 5.0e-5
+batch_size: 64
+grad_accum: 1
+max_steps: 256000
+mixed_precision: bf16
+seed: 1337
+num_workers: 8
+
+# inpainting objective
+latent_rec_lambda: 0.15
+latent_rec_lambda_warmup_steps: 4000
+loss_sigma_weight: true
+
+# (optional, 기본값 0이라면 제거 가능)
+# keep_consistency_lambda: 0.0
+# garment_rec_lambda: 0.0
+
+# preview
+preview_infer_steps: 60
+preview_seed: 1234
+preview_strength: 0.3
+preview_rows: 4
+
+# checkpoints & logging
+save_epoch_ckpt: 25
+default_resume_ckpt: null
+resume_ckpt: null
+save_root_dir: logs
+save_name: catvton_sd35_inpaint
+log_every: 10
+image_every: 200
+
+# runtime
+hf_token: "${HUGGINGFACE_TOKEN}"

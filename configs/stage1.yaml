@@ -12,11 +12,11 @@ use_scaler: true
 disable_text: true
 lr: 5.0e-5                      # transformer (살짝 상향)
 proj_lr: 1.0e-4                 # projector 전용 (조금 더 공격적)
-batch_size: 6                   # server 20250910
+batch_size: 64                  # server 20250910
 grad_accum: 1
 max_steps: 256000
 cond_dropout_p: 0.1
-mixed_precision: bf16
+mixed_precision: fp16
 seed: 1337
 num_workers: 8
 
@@ -44,7 +44,7 @@ resume_ckpt: None
 save_root_dir: logs
 save_name: catvton_sd35_mask
 log_every: 10
-image_every: 100
+image_every: 200
 save_every: 12800
 
 # adapter / projector

@@ -1,6 +1,7 @@
 __pycache__
 /DATA/
 /logs/
+/sd35_dumps/
 *.jpg
 *.png
 model/__pycache__
