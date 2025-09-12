@@ -232,36 +232,56 @@ def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------
 # Freezing & attention backend
 # ------------------------------------------------------------
-def freeze_all_but_self_attn_qkv(transformer):
-    # 1) 전체 동결
+def freeze_all_but_self_attn_qkv(transformer, open_to_add_out: bool=False, open_io: bool=True):
+    # 0) 모두 동결
     for p in transformer.parameters():
         p.requires_grad = False
 
-    kept = []
-    for name, module in transformer.named_modules():
-        has_proj = any(hasattr(module, a) for a in (
-            "to_q","to_k","to_v","to_out","q_proj","k_proj","v_proj","qkv","qkv_proj"
-        ))
-        if not has_proj:
-            continue
-        is_cross = getattr(module, "is_cross_attention", None)
-        if is_cross is None:
-            is_cross = bool(getattr(module, "cross_attention_dim", 0))
-        if is_cross:
-            continue  # cross-attn은 학습 제외(사실상 비활성화 효과)
+    # 1) self-attn Q/K/V/Out만 해제
+    for name, m in transformer.named_modules():
+        if name.endswith(".attn") or hasattr(m, "to_q"):
+            for attr in ["to_q","to_k","to_v","to_out"]:
+                sub = getattr(m, attr, None)
+                if sub is not None:
+                    for p in sub.parameters():
+                        p.requires_grad = True
 
-        for attr in ("to_q","to_k","to_v","to_out","q_proj","k_proj","v_proj","qkv","qkv_proj"):
-            subm = getattr(module, attr, None)
-            if subm is None:
-                continue
-            for pn, p in subm.named_parameters(recurse=True):
+    # 2) cross 경로: 기본은 전부 동결, 단 to_add_out만 옵션으로 오픈
+    for name, m in transformer.named_modules():
+        if name.endswith(".attn"):
+            # 항상 동결
+            for attr in ["add_k_proj","add_v_proj","add_q_proj"]:
+                sub = getattr(m, attr, None)
+                if sub is not None:
+                    for p in sub.parameters():
+                        p.requires_grad = False
+            # 옵션: to_add_out만 열기
+            sub = getattr(m, "to_add_out", None)
+            if sub is not None:
+                for p in sub.parameters():
+                    p.requires_grad = bool(open_to_add_out)
+
+    # 3) 입/출력 적응(패치임베더/헤드)도 열기(권장)
+    if open_io:
+        if hasattr(transformer, "pos_embed") and hasattr(transformer.pos_embed, "proj"):
+            for p in transformer.pos_embed.proj.parameters():
                 p.requires_grad = True
-                if len(kept) < 16:
-                    kept.append(f"{name}.{attr}.{pn}")
+        for p in transformer.norm_out.parameters():
+            p.requires_grad = True
+        for p in transformer.proj_out.parameters():
+            p.requires_grad = True
 
+    # 통계
     trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    kept = [n for n, p in transformer.named_parameters() if p.requires_grad][:16]
     if trainable == 0:
         raise RuntimeError("No params unfrozen; check patterns.")
+
+    # 안전 확인: add_*는 to_add_out 외엔 모두 동결
+    for n, p in transformer.named_parameters():
+        if (".attn.add_" in n) and (".attn.to_add_out" not in n) and p.requires_grad:
+            raise RuntimeError(f"Cross add path unexpectedly trainable: {n}")
+
     return trainable, kept
 
 
@@ -434,10 +454,36 @@ class CatVTON_SD3_Trainer:
             sanity_check_self_vs_cross(self.transformer.module, tag="init_after_ddp")
             _debug_print_trainables(self.transformer.module, "after_ddp")
 
-        # optimizer: transformer only
-        tf_params = [p for p in self.transformer.parameters() if p.requires_grad]
+        # optimizer: 파라미터 그룹 (QKV/OUT, IO, to_add_out)
+        qkv_params, add_out_params, io_params = [], [], []
+        for n, p in self.transformer.named_parameters():
+            if not p.requires_grad:
+                continue
+            # self-attn 경로
+            if (".attn.to_q" in n) or (".attn.to_k" in n) or (".attn.to_v" in n) or (".attn.to_out" in n):
+                qkv_params.append(p)
+            # cross 추가 출력 경로 (freeze 함수에서 open_to_add_out=True일 때만 모임)
+            elif ".attn.to_add_out" in n:
+                add_out_params.append(p)
+            # 입출력 적응 레이어
+            elif ("pos_embed.proj" in n) or ("norm_out" in n) or ("proj_out" in n):
+                io_params.append(p)
+
+        param_groups = []
+        if qkv_params:
+            param_groups.append({"params": qkv_params, "lr": cfg.lr})                # 예: 5e-5
+        if io_params:
+            param_groups.append({"params": io_params, "lr": cfg.lr * 2.0})          # 예: 1e-4
+        if add_out_params:
+            param_groups.append({"params": add_out_params, "lr": cfg.lr * 0.5})     # 예: 2.5e-5
+
+        # 혹시라도 아무 그룹도 잡히지 않으면(예: 전부 동결) 안전한 fallback
+        if not param_groups:
+            tf_params = [p for p in self.transformer.parameters() if p.requires_grad]
+            param_groups = [{"params": tf_params, "lr": cfg.lr}]
+
         self.optimizer = torch.optim.AdamW(
-            [{"params": tf_params, "lr": cfg.lr}],
+            param_groups,
             betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
         )
 
@@ -454,6 +500,8 @@ class CatVTON_SD3_Trainer:
 
         # scaler
         self.scaler = torch_amp.GradScaler(enabled=self.use_scaler)
+        self._dumped_mask_once = False
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
     # ---------------- utilities ----------------
     def _encode_prompts(self, bsz:int):
@@ -482,72 +530,114 @@ class CatVTON_SD3_Trainer:
         x_scaled = x_f32 / torch.sqrt(s * s + 1.0)
         return x_scaled.to(x.dtype)
 
-    def _ensure_fm_sigmas(self, scheduler, num_steps: int) -> torch.Tensor:
-        scheduler.set_timesteps(num_steps, device=self.device)
-        sigmas = getattr(scheduler, "sigmas", None)
-        if not (torch.is_tensor(sigmas) and sigmas.numel() > 0):
-            sigma_min = float(getattr(scheduler.config, "sigma_min", 0.03))
-            sigma_max = float(getattr(scheduler.config, "sigma_max", 14.61))
-            rho = float(getattr(scheduler.config, "rho", 7.0))
-            i = torch.linspace(0, 1, num_steps, device=self.device, dtype=torch.float32)
-            sigmas = (sigma_max ** (1.0 / rho) + i * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))) ** rho
-        sigmas = sigmas.to(device=self.device, dtype=torch.float32)
+    def _set_fm_timesteps(self, scheduler, num_steps: int) -> torch.Tensor:
+        H, W = self.cfg.size_h, self.cfg.size_w
+        sched = FM.from_config(scheduler.config)
+        kwargs = {}
+        # SD3는 latent 채널=16, patch_size=2(모델 설정 참조)
+        tf = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+        patch = getattr(tf, "config").patch_size
+        vae_sf = self.vae_scale_factor
+
+        if getattr(sched.config, "use_dynamic_shifting", False):
+            image_seq_len = (H // vae_sf // patch) * ((2 * W) // vae_sf // patch)  # 너는 W축 concat이라 2*W
+            base_len  = getattr(sched.config, "base_image_seq_len", 256)
+            max_len   = getattr(sched.config, "max_image_seq_len", 4096)
+            base_s    = getattr(sched.config, "base_shift", 0.5)
+            max_s     = getattr(sched.config, "max_shift", 1.16)
+            mu = base_s + (max_s - base_s) * (image_seq_len - base_len) / max(1, (max_len - base_len))
+            kwargs["mu"] = float(mu)
+
+        sched.set_timesteps(num_steps, device=self.device, **kwargs)
+        # FM에선 timesteps=σ 벡터; 끝이 0이 아니면 0 추가
+        sigmas = sched.timesteps
         if sigmas[-1] != 0:
             sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
+            sched.timesteps = sigmas
+        sched.sigmas = sigmas  # 추가 권장
+        return sched, sigmas
+
+    def _ensure_fm_sigmas(self, scheduler, num_steps: int) -> torch.Tensor:
+        """이제는 _set_fm_timesteps를 통해 스케줄러가 직접 σ를 만들도록 위임한다(mus 포함)."""
+        H, W = self.cfg.size_h, self.cfg.size_w
+        sched, sigmas = self._set_fm_timesteps(scheduler, num_steps)
+        # 스케줄러 객체도 최신 timesteps로 업데이트
         try:
-            scheduler.sigmas = sigmas.clone()
+            scheduler.sigmas    = sigmas.clone()
             scheduler.timesteps = sigmas.clone()
         except Exception:
             pass
-        return sigmas
+        return sched, sigmas
 
     # ---------------- preview / inference ----------------
     @torch.no_grad()
     def _build_preview_scheduler(self, num_steps: int, start_idx: int):
         steps = max(2, int(num_steps))
-        sched = FM.from_config(self.scheduler.config)
-        sigmas_full = self._ensure_fm_sigmas(sched, steps)
-        start_idx = min(max(0, int(start_idx)), int(sigmas_full.numel()) - 2)
+        # mu 반영된 전체 스케줄 생성
+        H, W = self.cfg.size_h, self.cfg.size_w
+        sched_full, sigmas_full = self._set_fm_timesteps(self.scheduler, steps)
 
+        start_idx = min(max(0, int(start_idx)), int(sigmas_full.numel()) - 2)
         sigmas_sub = sigmas_full[start_idx:].contiguous()
         if sigmas_sub[-1] != 0:
             sigmas_sub = torch.cat([sigmas_sub, sigmas_sub.new_zeros(1)])
 
+        # 서브 스케줄러 생성
+        sched = FM.from_config(self.scheduler.config)
         try:
-            sched.sigmas = sigmas_sub.clone()
+            sched.sigmas    = sigmas_sub.clone()
             sched.timesteps = sigmas_sub.clone()
             if hasattr(sched, "step_index"):  sched.step_index = 0
             if hasattr(sched, "_step_index"): sched._step_index = 0
         except Exception:
             pass
-
         return sched, sigmas_sub
 
     @torch.no_grad()
-    def _preview_sample(self, batch, num_steps: int, global_step: int = 0):
+    def _preview_sample(
+        self, batch, num_steps: int, global_step: int = 0,
+        Xi_override: torch.Tensor = None,
+        noise_override: torch.Tensor = None,
+        start_idx_override: Optional[int] = None,
+    ):
         H, W = self.cfg.size_h, self.cfg.size_w
         x_in = batch["x_concat_in"].to(self.device, self.dtype)
         m    = batch["m_concat"].to(self.device, self.dtype)
 
-        Xi = to_latent_sd3(self.vae, x_in).to(self.dtype)                 # [B,16,h,w]
-        Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)  # [B,1,h,w]
+        Xi = (Xi_override.to(self.dtype)
+            if Xi_override is not None
+            else self._encode_vae_latents(x_in, generator=self._preview_gen, sample=True).to(self.dtype))
+        Mi = F.interpolate(m, size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor), mode="nearest").to(self.dtype)
         K  = Mi.float()                  # KEEP
         Hmask = 1.0 - K                  # HOLE
         B = Xi.shape[0]
 
         sched_full = FM.from_config(self.scheduler.config)
-        sigmas_full = self._ensure_fm_sigmas(sched_full, max(2, int(num_steps)))
+        _, sigmas_full = self._ensure_fm_sigmas(sched_full, max(2, int(num_steps)))
         if sigmas_full.numel() < 2:
             return self._denorm(x_in)
 
-        s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
-        start_idx = min(int(s * (sigmas_full.numel() - 1)), sigmas_full.numel() - 2)
-        sched, sigmas = self._build_preview_scheduler(num_steps, start_idx)
+        if start_idx_override is not None:
+            start_idx = int(start_idx_override)
+        else:
+            s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
+            N = sigmas_full.numel() - 1
+            start_idx = min(max(int((1.0 - s) * N), 0), sigmas_full.numel() - 2)
 
-        # 초기화: 공식 inpaint 방식 — 전체 Xi에 동일 노이즈 부여
-        noise  = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=self._preview_gen)
-        sigma0 = sigmas[0].to(Xi.device, torch.float32)
-        z = (Xi.float() + sigma0 * noise).float()
+        sched, sigmas = self._build_preview_scheduler(num_steps, start_idx)
+        
+        is_strength_max = (float(self.cfg.preview_strength) >= 1.0 - 1e-8)
+        
+        noise = (noise_override
+            if noise_override is not None
+            else torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=self._preview_gen))
+
+        # SD3 inpaint: strength=1.0이면 초기 latents=그 'noise' 자체를 사용
+        if is_strength_max:
+            z = noise.float()
+        else:
+            sigma0 = sigmas[0].to(Xi.device, torch.float32)
+            z = sched.scale_noise(Xi.float(), sigma0[None], noise).float()
 
         prompt_embeds, pooled = self._encode_prompts(B)
         model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
@@ -555,16 +645,17 @@ class CatVTON_SD3_Trainer:
         was_train = model.training
         model.eval()
         try:
-            timesteps = sched.sigmas
+            timesteps = getattr(sched, "sigmas", getattr(sched, "timesteps"))
             n_steps = int(timesteps.numel() - 1)
             for i in range(n_steps):
                 sigma_t   = timesteps[i].to(Xi.device, torch.float32)
                 sigma_t_b = sigma_t.expand(B)
 
-                try:
-                    z_in = sched.scale_model_input(z, sigma_t_b)
-                except Exception:
-                    z_in = self._fm_scale(z, sigma_t_b)
+                # try:
+                #     z_in = sched.scale_model_input(z, sigma_t_b)
+                # except Exception:
+                #     z_in = self._fm_scale(z, sigma_t_b)
+                z_in = z
 
                 with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):
                     eps_pred = model(
@@ -580,8 +671,8 @@ class CatVTON_SD3_Trainer:
 
                 # per-step recomposition (공식 inpaint): HOLE만 현재 z 유지, KEEP은 Xi쪽으로 고정
                 sigma_next = timesteps[i + 1].to(Xi.device, torch.float32)
-                init_latents_proper = (Xi.float() + sigma_next * noise).float()
-                z = (1.0 - Hmask) * init_latents_proper + Hmask * z
+                init_latents_proper = sched.scale_noise(Xi.float(), sigma_next[None], noise).float()
+                z = K * init_latents_proper + (1.0 - K) * z
 
             # decode & 최종 픽셀 합성(보기 좋게)
             x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
@@ -591,35 +682,38 @@ class CatVTON_SD3_Trainer:
         finally:
             if was_train:
                 model.train()
-
-    @torch.no_grad()
-    def one_step_teacher_forcing(self, x_in, x_gt, m, recompose=True):
+ 
+    @torch.no_grad()    
+    def one_step_teacher_forcing(
+        self, x_in, x_gt, m, sigma0: torch.Tensor, noise: torch.Tensor, recompose=True,
+        Xi_override: Optional[torch.Tensor]=None, z0_override: Optional[torch.Tensor]=None
+    ):
         """ 학습 분포에서 1-step teacher forcing 확인: ε̂→z0_hat→decode """
         H, W = self.cfg.size_h, self.cfg.size_w
-        Xi = to_latent_sd3(self.vae, x_in).float()
-        z0 = to_latent_sd3(self.vae, x_gt).float()
-        Mi = F.interpolate(m, size=(H//8, (2*W)//8), mode="nearest").float()
+        # SD3와 동일하게 posterior.sample(generator) 사용
+        Xi = (Xi_override.float()
+            if Xi_override is not None
+            else self._encode_vae_latents(x_in, generator=self._preview_gen, sample=True).float())
+        z0 = (z0_override.float()
+            if z0_override is not None
+            else self._encode_vae_latents(x_gt, generator=self._preview_gen, sample=True).float())
+        Mi = F.interpolate(m, size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor), mode="nearest").float()
         B = Xi.shape[0]
-        # sigma 샘플
-        sigmas = self._ensure_fm_sigmas(self.train_scheduler, int(self.cfg.preview_infer_steps))
-        idx = torch.randint(0, sigmas.numel() - 1, (B,), device=Xi.device)
-        sigma = sigmas.index_select(0, idx).view(B,1,1,1).float()
+        sigma_b = sigma0.to(Xi).expand(B)
 
-        eps   = torch.randn_like(z0)
-        x_t   = Mi*(Xi + sigma*eps) + (1.0 - Mi)*(z0 + sigma*eps)
-
-        try:    z_in = self.train_scheduler.scale_model_input(x_t, sigma.view(B))
-        except: z_in = self._fm_scale(x_t,           sigma.view(B))
+        Xi_noisy = self.train_scheduler.scale_noise(Xi, sigma_b, noise)
+        z0_noisy = self.train_scheduler.scale_noise(z0, sigma_b, noise)
+        x_t = Mi * Xi_noisy + (1.0 - Mi) * z0_noisy
 
         prompt_embeds, pooled = self._encode_prompts(B)
         with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):
             eps_pred = (self.transformer.module if isinstance(self.transformer, DDP) else self.transformer)(
-                hidden_states=z_in.to(self.dtype), timestep=sigma.view(B),
+                hidden_states=x_t.to(self.dtype), timestep=sigma_b,
                 encoder_hidden_states=prompt_embeds, pooled_projections=pooled, return_dict=True
             ).sample.float()
 
-        z0_hat = x_t - sigma*eps_pred
-        x_hat  = from_latent_sd3(self.vae, z0_hat.to(self.dtype))  # [-1..1]
+        z0_hat = x_t.float() - sigma_b.view(B,1,1,1) * eps_pred.float()
+        x_hat  = from_latent_sd3(self.vae, z0_hat.to(self.dtype))
         if recompose:
             K3 = m.repeat(1, 3, 1, 1)
             x_final = K3 * x_in + (1.0 - K3) * x_hat
@@ -634,15 +728,18 @@ class CatVTON_SD3_Trainer:
         device = self.device
         H, W = self.cfg.size_h, self.cfg.size_w
 
-        Xi = to_latent_sd3(self.vae, x_in.to(self.dtype)).float()
-        Mi = F.interpolate(m.to(self.dtype), size=(H // 8, (2 * W) // 8), mode="nearest").float()
-        Hmask = 1.0 - Mi
+        gen = (torch.Generator(device=device).manual_seed(int(seed)) if seed is not None else self._preview_gen)
+        Xi = self._encode_vae_latents(x_in.to(self.dtype), generator=gen, sample=True).float()
+        Mi = F.interpolate(m, size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor), mode="nearest").float()
+        K = Mi
+        Hmask = 1.0 - K
         B = Xi.shape[0]
 
-        sched = FM.from_config(self.scheduler.config)
-        sigmas_full = self._ensure_fm_sigmas(sched, max(2, int(steps)))
+        sched_full = FM.from_config(self.scheduler.config)
+        sched, sigmas_full = self._ensure_fm_sigmas(sched_full, max(2, int(steps)))
         s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
-        start_idx = min(int(s * (sigmas_full.numel() - 1)), sigmas_full.numel() - 2)
+        N = sigmas_full.numel() - 1
+        start_idx = min(max(int((1.0 - s) * N), 0), sigmas_full.numel() - 2)
         sigmas = sigmas_full[start_idx:].contiguous()
         if sigmas[-1] != 0: sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
         try:
@@ -652,11 +749,14 @@ class CatVTON_SD3_Trainer:
             if hasattr(sched, "_step_index"): sched._step_index = 0
         except Exception:
             pass
-
-        gen = (torch.Generator(device=device).manual_seed(int(seed)) if seed is not None else self._preview_gen)
+        
         noise = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=gen)
-        s0 = sigmas[0].to(Xi)
-        z = (Xi + s0 * noise).float()
+        is_strength_max = (float(self.cfg.preview_strength) >= 1.0 - 1e-8)
+        if is_strength_max:
+            z = noise.float()   # SD3: strength=1.0이면 초기값=noise
+        else:
+            s0 = sigmas[0].to(Xi.device, torch.float32)
+            z = sched.scale_noise(Xi.float(), s0[None], noise).float()
 
         prompt_embeds, pooled = self._encode_prompts(B)
         model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
@@ -669,10 +769,11 @@ class CatVTON_SD3_Trainer:
                 sigma_t   = timesteps[i].to(Xi)
                 sigma_t_b = sigma_t.expand(B)
 
-                try:
-                    z_in = sched.scale_model_input(z, sigma_t_b)
-                except Exception:
-                    z_in = self._fm_scale(z, sigma_t_b)
+                # try:
+                #     z_in = sched.scale_model_input(z, sigma_t_b)
+                # except Exception:
+                #     z_in = self._fm_scale(z, sigma_t_b)
+                z_in = z
 
                 with torch.amp.autocast(device_type="cuda", dtype=self.dtype, enabled=(device.type == "cuda")):
                     eps_pred = model(
@@ -685,9 +786,9 @@ class CatVTON_SD3_Trainer:
 
                 z = sched.step(eps_pred, sigma_t, z).prev_sample.float()
 
-                sigma_next = timesteps[i + 1].to(Xi)
-                init_latents_proper = (Xi + sigma_next * noise).float()
-                z = (1.0 - Hmask) * init_latents_proper + Hmask * z
+                sigma_next = timesteps[i + 1].to(Xi, torch.float32)
+                init_latents_proper = sched.scale_noise(Xi.float(), sigma_next[None], noise).float()
+                z = K * init_latents_proper + (1.0 - K) * z
 
             x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
             K3_keep = m.repeat(1, 3, 1, 1)
@@ -751,19 +852,36 @@ class CatVTON_SD3_Trainer:
 
         # Xi+noise 미리보기
         num_steps = max(2, int(self.cfg.preview_infer_steps))
-        Xi_lat = to_latent_sd3(self.vae, x_in).to(self.dtype)
-        _, sigmas_probe = self._build_preview_scheduler(num_steps, 0)
+        sched_full, sigmas_full = self._set_fm_timesteps(self.scheduler, num_steps)
+        s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
+        N = sigmas_full.numel() - 1
+        start_idx = min(max(int((1.0 - s) * N), 0), sigmas_full.numel() - 2)
+        sched_probe, sigmas_probe = self._build_preview_scheduler(num_steps, start_idx)
+        # SD3와 동일: posterior.sample + 공유 generator
+        Xi_lat = self._encode_vae_latents(x_in, generator=self._preview_gen, sample=True).to(self.dtype)
+        z0_lat = self._encode_vae_latents(x_gt, generator=self._preview_gen, sample=True).to(self.dtype)
         sigma0 = sigmas_probe[0].to(Xi_lat.device, torch.float32)
-        noise0 = torch.randn(Xi_lat.shape, dtype=torch.float32, device=Xi_lat.device, generator=self._preview_gen)
-        xi_noisy_img = from_latent_sd3(self.vae, (Xi_lat.float() + sigma0 * noise0).to(self.dtype))
+        shared_noise = torch.randn(Xi_lat.shape, dtype=torch.float32, device=Xi_lat.device, generator=self._preview_gen)
+        z_init = shared_noise if s >= 1.0 - 1e-8 else sched_probe.scale_noise(Xi_lat.float(), sigma0[None], shared_noise).float()
+        xi_noisy_img = from_latent_sd3(self.vae, z_init.to(self.dtype))
         xi_noisy_img = torch.clamp((xi_noisy_img + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
 
-        # inpaint preview
-        pred_img_final = self._preview_sample({"x_concat_in": x_in, "m_concat": m}, num_steps=num_steps, global_step=global_step)
+        # inpaint preview        
+        pred_img_final = self._preview_sample(
+            {"x_concat_in": x_in, "m_concat": m},
+            num_steps=num_steps,
+            global_step=global_step,
+            Xi_override=Xi_lat.float(),
+            noise_override=shared_noise,
+            start_idx_override=start_idx,
+        )
 
         # one-step TF
-        one_step_img = self.one_step_teacher_forcing(x_in, x_gt, m, recompose=True)
-
+        one_step_img = self.one_step_teacher_forcing(
+            x_in, x_gt, m,
+            sigma0=sigma0, noise=shared_noise, recompose=True,
+            Xi_override=Xi_lat.float(), z0_override=z0_lat.float()
+        )
         # 패널 빌드
         _, _, Hh, WW = x_gt.shape
         Ww = WW // 2
@@ -800,9 +918,19 @@ class CatVTON_SD3_Trainer:
         save_image(final_img, out_path)
         self.logger.info(f"[img] saved preview at step {global_step}: {out_path}")
 
+    @torch.no_grad()
+    def _encode_vae_latents(self, x: torch.Tensor, generator: Optional[torch.Generator] = None, sample: bool = True):
+        vdtype = next(self.vae.parameters()).dtype
+        posterior = self.vae.encode(x.to(vdtype)).latent_dist
+        lat = posterior.sample(generator=generator) if sample else posterior.mean
+        sf = self.vae.config.scaling_factor
+        sh = getattr(self.vae.config, "shift_factor", 0.0)
+        return (lat - sh) * sf
+
     # ---------------- training core ----------------
     def _sample_sigmas(self, scheduler, B: int) -> torch.Tensor:
-        sigmas = self._ensure_fm_sigmas(scheduler, int(self.cfg.preview_infer_steps))
+        # 스케줄러 내부 timesteps/sigmas까지 실제로 채워 넣음
+        _, sigmas = self._ensure_fm_sigmas(scheduler, int(self.cfg.preview_infer_steps))
         idx = torch.randint(0, sigmas.numel() - 1, (B,), device=self.device)
         return sigmas.index_select(0, idx).to(self.device)
 
@@ -813,29 +941,48 @@ class CatVTON_SD3_Trainer:
         m_concat = batch["m_concat"].to(self.device, self.dtype)
 
         with torch.no_grad():
-            Xi = to_latent_sd3(self.vae, x_concat_in).to(self.dtype)   # [B,16,h,w]
-            z0 = to_latent_sd3(self.vae, x_concat_gt).to(self.dtype)   # [B,16,h,w]
-            Mi = F.interpolate(m_concat, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)  # [B,1,h,w]
+            Xi = self._encode_vae_latents(x_concat_in, generator=None, sample=True).to(self.dtype)
+            z0 = self._encode_vae_latents(x_concat_gt, generator=None, sample=True).to(self.dtype)
+            Mi = F.interpolate(m_concat, size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor), mode="nearest").to(self.dtype)  # [B,1,h,w]
 
         B = Xi.shape[0]
         K = Mi.float()        # KEEP
         Hmask = 1.0 - K       # HOLE
+        
+        if (self.is_main and (not self._dumped_mask_once) and global_step == 0):
+            # latent 해상도 마스크를 픽셀 해상도로 업샘플해서 보이기 쉽게 저장
+            Mi_pix    = F.interpolate(Mi,    size=(H, 2 * W), mode="nearest").clamp(0, 1)
+            Hmask_pix = (1.0 - Mi).clamp(0, 1)
+            Hmask_pix = F.interpolate(Hmask_pix, size=(H, 2 * W), mode="nearest").clamp(0, 1)
+
+            vis_keep = Mi_pix[:1].repeat(1, 3, 1, 1)     # 흰색=KEEP
+            vis_hole = Hmask_pix[:1].repeat(1, 3, 1, 1)  # 흰색=HOLE
+
+            save_image(vis_keep, os.path.join(self.img_dir, "debug_mask_keep_pixel.png"))
+            save_image(vis_hole, os.path.join(self.img_dir, "debug_mask_hole_pixel.png"))
+
+            # 원본 입력과도 나란히 보고 싶으면(선택):
+            # save_image(self._denorm(x_concat_gt[:1]), os.path.join(self.img_dir, "debug_gt_pair.png"))
+
+            self.logger.info("[debug] dumped debug_mask_keep_pixel.png / debug_mask_hole_pixel.png")
+            self._dumped_mask_once = True
 
         # sigma sample
-        sigmas = self._sample_sigmas(self.train_scheduler, B)
+        sigmas = self._sample_sigmas(self.train_scheduler, B)      # [B] (mu 반영된 스케줄에서 샘플)
         noise  = torch.randn_like(z0, dtype=torch.float32)
 
-        sigma_b11 = sigmas.view(B, 1, 1, 1).float()
-        z0_noisy  = z0.float() + sigma_b11 * noise
-        Xi_noisy  = Xi.float() + sigma_b11 * noise
-        x_t_mixed = K * Xi_noisy + Hmask * z0_noisy   # 공식 inpaint mixing
+        # 동일 난수를 Xi/z0에 적용하여 둘 다 FM 방식으로 노이징
+        Xi_noisy = self.train_scheduler.scale_noise(Xi.float(), sigmas, noise)
+        z0_noisy = self.train_scheduler.scale_noise(z0.float(), sigmas, noise)
+        x_t_mixed = K * Xi_noisy + Hmask * z0_noisy
 
         target = noise  # ε-target
 
-        try:
-            z_in = self.train_scheduler.scale_model_input(x_t_mixed, sigmas)
-        except Exception:
-            z_in = self._fm_scale(x_t_mixed, sigmas)
+        # try:
+        #     z_in = self.train_scheduler.scale_model_input(x_t_mixed, sigmas)
+        # except Exception:
+        #     z_in = self._fm_scale(x_t_mixed, sigmas)
+        z_in = x_t_mixed
 
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(B)
 
@@ -852,15 +999,18 @@ class CatVTON_SD3_Trainer:
         eps_pred_f32 = eps_pred.float()
 
         # --------- Losses ---------
-        # ε-MSE: HOLE만
+        # ε-MSE: HOLE만 (면적 정규화)
+        C = z0.shape[1]
+        denom = (Hmask.sum() * C).clamp_min(1.0)
         if bool(self.cfg.get("loss_sigma_weight", False)):
+            sigma_b11 = sigmas.view(B, 1, 1, 1).float()
             w = 1.0 / (sigma_b11 ** 2 + 1.0)
-            loss_eps = torch.mean(((eps_pred_f32 - target) ** 2) * Hmask * w)
+            loss_eps = ((((eps_pred_f32 - target) ** 2) * Hmask) * w).sum() / denom
         else:
-            loss_eps = torch.mean(((eps_pred_f32 - target) ** 2) * Hmask)
+            loss_eps = (((eps_pred_f32 - target) ** 2) * Hmask).sum() / denom
 
         # latent x0 재구성: HOLE만 (선택)
-        z0_hat = x_t_mixed.float() - sigma_b11 * eps_pred_f32
+        z0_hat = x_t_mixed.float() - sigmas.view(B,1,1,1).float() * eps_pred_f32
         rec_lambda = float(self.cfg.latent_rec_lambda)
         warmup_steps = int(getattr(self.cfg, "latent_rec_lambda_warmup_steps", 0))
         if warmup_steps > 0 and global_step < warmup_steps:
@@ -873,7 +1023,7 @@ class CatVTON_SD3_Trainer:
         keep_lambda = float(self.cfg.get("keep_consistency_lambda", 0.0))
         loss_keep = torch.tensor(0.0, device=self.device)
         if keep_lambda > 0.0:
-            loss_keep = torch.mean(((z0_hat - z0.float()) ** 2) * K)
+            loss_keep = (((z0_hat - z0.float()) ** 2) * K).sum() / K.sum().clamp_min(1.0)
 
         # Garment recon (옵션, 기본 0)
         gar_lambda = float(self.cfg.get("garment_rec_lambda", 0.0))

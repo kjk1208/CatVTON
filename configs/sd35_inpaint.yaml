@@ -8,7 +8,7 @@ mask_based: true
 invert_mask: true
 
 # training
-lr: 5.0e-5
+lr: 1.0e-5
 batch_size: 64
 grad_accum: 1
 max_steps: 256000
@@ -17,18 +17,18 @@ seed: 1337
 num_workers: 8
 
 # inpainting objective
-latent_rec_lambda: 0.15
-latent_rec_lambda_warmup_steps: 4000
-loss_sigma_weight: true
+latent_rec_lambda: 0.10
+latent_rec_lambda_warmup_steps: 2000
+loss_sigma_weight: false
 
 # (optional, 기본값 0이라면 제거 가능)
 # keep_consistency_lambda: 0.0
 # garment_rec_lambda: 0.0
 
 # preview
-preview_infer_steps: 60
+preview_infer_steps: 28
 preview_seed: 1234
-preview_strength: 0.3
+preview_strength: 0.8
 preview_rows: 4
 
 # checkpoints & logging
@@ -38,7 +38,7 @@ resume_ckpt: null
 save_root_dir: logs
 save_name: catvton_sd35_inpaint
 log_every: 10
-image_every: 200
+image_every: 100
 
 # runtime
 hf_token: "${HUGGINGFACE_TOKEN}"
