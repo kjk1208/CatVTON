@@ -1,0 +1,50 @@
+list_file: DATA/VITON-HD/vitonhd_train_mask.csv
+sd3_model: stabilityai/stable-diffusion-3.5-large
+
+size_h: 512
+size_w: 384
+
+mask_based: true
+invert_mask: true
+disable_text: true
+
+# Training (Updated)
+lr: 1.0e-4
+batch_size: 8  # 줄임 (메모리 절약)
+grad_accum: 4   # 늘림 (effective batch = 128 유지)
+max_steps: 256000
+mixed_precision: bf16
+seed: 1337
+num_workers: 8
+
+# SD3 Loss Configuration (Updated)
+loss_sigma_weight: true  # 활성화 (수정된 코드에서 중요)
+weighting_scheme: logit_normal
+logit_mean: 0.0
+logit_std: 1.0
+mode_scale: 1.29
+
+# Preview (Updated for SD3.5)
+preview_infer_steps: 28  # SD3.5 최적값
+preview_seed: 1234
+preview_strength: 0.40    # 적당한 디노이징 (너무 높으면 t가 과도해서 불안정함)
+preview_rows: 2          # 메모리 절약을 위해 줄임
+
+# Checkpoints & Logging
+save_epoch_ckpt: 25
+default_resume_ckpt: null
+resume_ckpt: null
+save_root_dir: logs
+save_name: fixed_catvton_sd35  # 업데이트된 이름
+log_every: 10
+image_every: 100
+
+# Scheduler (Updated)
+train_sched_steps: 1000  # 유지되지만 실제로는 자동 계산됨
+
+# Text & Dynamic Shifting (Updated)
+fixed_prompt: "high quality, detailed, photorealistic"  # 구체적인 프롬프트
+disable_dynamic_shifting: false  # 활성화 (중요한 변경!)
+
+# Runtime
+hf_token: "${HUGGINGFACE_TOKEN}"

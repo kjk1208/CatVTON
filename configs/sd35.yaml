@@ -6,9 +6,10 @@ size_w: 384
 
 mask_based: true
 invert_mask: true
+disable_text: true
 
 # training
-lr: 3.0e-4
+lr: 1.0e-4
 batch_size: 32
 grad_accum: 1
 max_steps: 256000
@@ -18,7 +19,7 @@ num_workers: 8
 
 # inpainting objective
 latent_rec_lambda: 0.5
-latent_rec_lambda_warmup_steps: 2000
+latent_rec_lambda_warmup_steps: 1000
 loss_sigma_weight: false
 loss_sigma_weight_warmup_steps: 0
 
@@ -29,7 +30,7 @@ loss_sigma_weight_warmup_steps: 0
 # preview
 preview_infer_steps: 40
 preview_seed: 1234
-preview_strength: 0.35
+preview_strength: 0.90
 preview_rows: 4
 
 # checkpoints & logging
@@ -42,7 +43,7 @@ log_every: 10
 image_every: 100
 
 #new sigma
-train_sched_steps: 60
+train_sched_steps: 1000
 
 # Official SD3 training knobs
 weighting_scheme: logit_normal
@@ -50,6 +51,10 @@ logit_mean: 0.0
 logit_std: 1.0
 mode_scale: 1.29
 precondition_outputs: 1           # match official default
+
+# 고정 프롬프트
+fixed_prompt: None              # None면 기본 문구 사용
+disable_dynamic_shifting: True
 
 # runtime
 hf_token: "${HUGGINGFACE_TOKEN}"

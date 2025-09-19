@@ -1,4 +1,4 @@
-# train_sd35_inpaint.py — SD3.5 CatVTON (DDP-ready, true inpainting; NO projector)
+# train_sd35.py — SD3.5 CatVTON (DDP-ready, true inpainting; NO projector)
 # - Train: FlowMatch (official SD3-style sampling: indices→timesteps→sigmas, noisy_model_input) + official SD3 loss
 # - Infer/Preview: FlowMatch Euler + per-step recomposition (official inpaint style)
 # - Text: unconditional embeds only (no CLIP/T5 text usage by user; we still pull uncond from pipeline)
@@ -242,7 +242,7 @@ def from_latent_sd3(vae, z: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------
 # Freezing & attention backend
 # ------------------------------------------------------------
-def freeze_all_but_self_attn_qkv(transformer, open_to_add_out: bool=False, open_io: bool=True):
+def freeze_all_but_self_attn_qkv(transformer, open_to_add_out: bool=False, open_io: bool=False, open_ffn_blocks: list[int]=None, open_block_norms: bool=False):
     # 0) freeze all
     for p in transformer.parameters():
         p.requires_grad = False
@@ -279,6 +279,23 @@ def freeze_all_but_self_attn_qkv(transformer, open_to_add_out: bool=False, open_
         for p in transformer.proj_out.parameters():
             p.requires_grad = True
 
+     # 4) FFN 일부 블록 개방 (+선택적으로 블록 내 norm)
+    if open_ffn_blocks is not None:
+        blocks = getattr(transformer, "transformer_blocks", None)
+        if blocks is not None:
+            for idx in open_ffn_blocks:
+                if idx < 0 or idx >= len(blocks): continue
+                blk = blocks[idx]
+                for attr in ["ff", "ff_context"]:
+                    sub = getattr(blk, attr, None)
+                    if sub is not None:
+                        for p in sub.parameters(): p.requires_grad = True
+                if open_block_norms:
+                    for attr in ["norm2", "norm2_context"]:
+                        sub = getattr(blk, attr, None)
+                        if sub is not None:
+                            for p in sub.parameters(): p.requires_grad = True
+
     # safety
     for n, p in transformer.named_parameters():
         if (".attn.add_" in n) and (".attn.to_add_out" not in n) and p.requires_grad:
@@ -304,6 +321,23 @@ def sanity_check_self_vs_cross(model: nn.Module, tag: str = ""):
                     if is_cross: cross_cnt += p.numel()
                     else:        self_cnt  += p.numel()
     print(f"[sanity{(':'+tag) if tag else ''}] self-attn trainable={self_cnt/1e6:.2f}M, cross-attn trainable={cross_cnt/1e6:.2f}M")
+
+def _try_copy_running_script(dst_dir: str):
+    """
+    현재 실행 중인 트레이닝 스크립트를 dst_dir로 복사합니다.
+    torchrun 다중 프로세스 환경에서는 rank==0 에서만 호출하세요.
+    """
+    import shutil
+    try:
+        # sys.argv[0]이 가장 안전하게 "실행한 파일"을 가리킴
+        script_path = os.path.abspath(sys.argv[0])
+        if os.path.isfile(script_path):
+            base = os.path.basename(script_path)
+            dst_path = os.path.join(dst_dir, base)
+            shutil.copy2(script_path, dst_path)
+    except Exception as e:
+        print(f"[warn] failed to copy running script: {e}")
+
 
 
 # ------------------------------------------------------------
@@ -385,6 +419,8 @@ class CatVTON_SD3_Trainer:
         self.vae = pipe.vae
         self.transformer: SD3Transformer2DModel = pipe.transformer
         self.encode_prompt = pipe.encode_prompt
+        
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
         # ---- Schedulers ----
         self.train_scheduler = FM.from_config(pipe.scheduler.config)  # used to get base config
@@ -393,6 +429,16 @@ class CatVTON_SD3_Trainer:
         pred_type = getattr(pipe.scheduler.config, "prediction_type", "epsilon")
         self.train_scheduler.config.prediction_type = pred_type
         self.scheduler.config.prediction_type = pred_type
+    
+
+        # >>> ensure FM sigmas available
+        train_steps = int(getattr(self.cfg, "train_sched_steps", self.noise_scheduler_copy.config.num_train_timesteps))
+        self._ensure_fm_sigmas(self.noise_scheduler_copy, train_steps)
+        self._ensure_fm_sigmas(self.train_scheduler,      train_steps)
+        
+        self.noise_scheduler_copy.config.num_train_timesteps = train_steps
+        self.train_scheduler.config.num_train_timesteps       = train_steps
+        
         if self.is_main:
             self.logger.info(f"[sched] training/inference = FlowMatchEuler (pred={pred_type})")
             self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
@@ -404,8 +450,13 @@ class CatVTON_SD3_Trainer:
         except Exception as e:
             if self.is_main: print(f"[mem] gradient checkpointing not available: {e}")
 
+        # only self attention 20250916
         # Freeze except self-attn Q/K/V/Out
-        trainable_tf, keep_names_sample = freeze_all_but_self_attn_qkv(self.transformer)
+        tf = self.transformer  # DDP 래핑 전
+        N  = len(tf.transformer_blocks)
+        mid_ffn_blocks = list(range(N//3, min(N, 2*N//3 + 2)))
+
+        trainable_tf, keep_names_sample = freeze_all_but_self_attn_qkv(transformer=self.transformer, open_io=True, open_ffn_blocks=mid_ffn_blocks, open_block_norms=False)
         if self.is_main:
             sanity_check_self_vs_cross(self.transformer, tag="init_before_ddp")
         if self.dtype == torch.float16:
@@ -417,6 +468,8 @@ class CatVTON_SD3_Trainer:
         if self.is_main:
             print(f"Trainable params (transformer only)={trainable_tf/1e6:.2f}M")
             _debug_print_trainables(self.transformer, "after_freeze_before_ddp")
+        # only self attention 20250916 
+
 
         # data
         self.dataset = PairListDataset(
@@ -452,6 +505,7 @@ class CatVTON_SD3_Trainer:
             print(f"[amp] dtype={self.dtype}, use_scaler={self.use_scaler} (bf16 recommended on Ampere+/Hopper)")
 
         # DDP wrap
+        #self attention only 20250916
         self.transformer = DDP(
             self.transformer, device_ids=[self.local_rank], output_device=self.local_rank,
             broadcast_buffers=False, find_unused_parameters=False
@@ -459,18 +513,39 @@ class CatVTON_SD3_Trainer:
         if self.is_main:
             sanity_check_self_vs_cross(self.transformer.module, tag="init_after_ddp")
             _debug_print_trainables(self.transformer.module, "after_ddp")
-
+        #self attention only 20250916        
+        
+        # self attention only 20250916
         # optimizer: param groups
-        qkv_params, add_out_params, io_params = [], [], []
+
+        qkv_params, add_out_params, io_params, ffn_params = [], [], [], []
         for n, p in self.transformer.named_parameters():
             if not p.requires_grad:
                 continue
             if (".attn.to_q" in n) or (".attn.to_k" in n) or (".attn.to_v" in n) or (".attn.to_out" in n):
                 qkv_params.append(p)
+                if self.is_main:
+                    print(f"QKV param: {n}")
+                    self.logger.info(f"QKV param: {n}")                
             elif ".attn.to_add_out" in n:
                 add_out_params.append(p)
+                if self.is_main:
+                    print(f"Add out param: {n}")
+                    self.logger.info(f"Add out param: {n}")                
             elif ("pos_embed.proj" in n) or ("norm_out" in n) or ("proj_out" in n):
                 io_params.append(p)
+                if self.is_main:
+                    print(f"IO param: {n}")
+                    self.logger.info(f"IO param: {n}")                
+            elif (".ff." in n) or (".ff_context." in n):  # ★ FFN
+                ffn_params.append(p)
+                if self.is_main:
+                    print(f"FFN param: {n}")
+                    self.logger.info(f"FFN param: {n}")
+                
+
+        #assert len(io_params) == 0, "IO adapters should be frozen (pos_embed.proj/norm_out/proj_out)"
+        assert len(add_out_params) == 0, "to_add_out/add_* should be frozen"
 
         param_groups = []
         if qkv_params:
@@ -479,6 +554,8 @@ class CatVTON_SD3_Trainer:
             param_groups.append({"params": io_params, "lr": cfg.lr * 2.0})
         if add_out_params:
             param_groups.append({"params": add_out_params, "lr": cfg.lr * 0.5})
+        if ffn_params:
+            param_groups.append({"params": ffn_params, "lr": cfg.lr * 0.5})
         if not param_groups:
             tf_params = [p for p in self.transformer.parameters() if p.requires_grad]
             param_groups = [{"params": tf_params, "lr": cfg.lr}]
@@ -487,6 +564,8 @@ class CatVTON_SD3_Trainer:
             param_groups,
             betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
         )
+
+        # self attention only 20250916
 
         # resume (if any)
         self.start_epoch = 0
@@ -502,20 +581,54 @@ class CatVTON_SD3_Trainer:
         # scaler
         self.scaler = torch_amp.GradScaler(enabled=self.use_scaler)
         self._dumped_mask_once = False
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        
 
-    # ---------------- utilities ----------------
-    def _encode_prompts(self, bsz:int):
-        # unconditional prompt embeddings (empty strings), matching "no text" usage
-        if not hasattr(self, "_null_pe"):
+    def _encode_prompts(self, bsz: int):
+        """
+        고정 프롬프트를 반드시 str로 만들어 파이프라인에 전달.
+        encode_prompt는 str 또는 list[str]를 받는데, 여기서는 str을 사용.
+        """
+        # 1) 완전 비활성화: 파이프라인에서 '빈 프롬프트'로 얻은 uncond 임베딩만 사용
+        if getattr(self.cfg, "disable_text", False):
+            if not hasattr(self, "_uncond_pe"):
+                pe, _, ppe, _ = self.encode_prompt(
+                    prompt="", prompt_2="", prompt_3="",
+                    device=self.device, num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                )
+                self._uncond_pe  = pe.detach().to(self.dtype)
+                self._uncond_ppe = ppe.detach().to(self.dtype)
+
+            return (self._uncond_pe.expand(bsz, -1, -1).contiguous(),
+                    self._uncond_ppe.expand(bsz, -1).contiguous())
+
+        fixed_txt = getattr(
+            self.cfg,
+            "fixed_prompt",
+            "high-resolution, high-quality, highly detailed image; natural lighting; sharp focus"
+        )
+        # 어떤 입력이 와도 문자열이 되게 강제
+        if isinstance(fixed_txt, (list, tuple)):
+            fixed_txt = " ".join(map(str, fixed_txt))
+        elif not isinstance(fixed_txt, str):
+            fixed_txt = str(fixed_txt)
+
+        if not hasattr(self, "_fixed_pe"):
             pe, _, ppe, _ = self.encode_prompt(
-                prompt=[""], prompt_2=[""], prompt_3=[""],
-                device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False,
+                prompt=fixed_txt,        # ← 리스트 대신 문자열
+                prompt_2=fixed_txt,
+                prompt_3=fixed_txt,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
             )
-            self._null_pe  = pe.detach().to(self.dtype)
-            self._null_ppe = ppe.detach().to(self.dtype)
-        return (self._null_pe.expand(bsz, -1, -1).contiguous(),
-                self._null_ppe.expand(bsz, -1).contiguous())
+            self._fixed_pe  = pe.detach().to(self.dtype)
+            self._fixed_ppe = ppe.detach().to(self.dtype)
+
+        return (self._fixed_pe.expand(bsz, -1, -1).contiguous(),
+                self._fixed_ppe.expand(bsz, -1).contiguous())
+
+
 
     def _denorm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
@@ -539,7 +652,9 @@ class CatVTON_SD3_Trainer:
         patch = getattr(tf, "config").patch_size
         vae_sf = self.vae_scale_factor
 
-        if getattr(sched.config, "use_dynamic_shifting", False):
+        use_ds = (not getattr(self.cfg, "disable_dynamic_shifting", False)) and \
+                bool(getattr(sched.config, "use_dynamic_shifting", False))
+        if use_ds:
             image_seq_len = (H // vae_sf // patch) * ((2 * W) // vae_sf // patch)  # width doubled (concat)
             base_len  = getattr(sched.config, "base_image_seq_len", 256)
             max_len   = getattr(sched.config, "max_image_seq_len", 4096)
@@ -556,16 +671,20 @@ class CatVTON_SD3_Trainer:
         sched.sigmas = sigmas
         return sched, sigmas
 
-    def _ensure_fm_sigmas(self, scheduler, num_steps: int) -> torch.Tensor:
+    def _ensure_fm_sigmas(self, scheduler, num_steps: int):
         sched, sigmas = self._set_fm_timesteps(scheduler, num_steps)
+        
+        # 시그마가 내림차순인지 확인
+        if sigmas[0] < sigmas[-1]:  # 만약 오름차순이면
+            print("sigmas가 오름차순!!!!")
         try:
-            scheduler.sigmas    = sigmas.clone()
-            scheduler.timesteps = sigmas.clone()
+            scheduler.sigmas    = sigmas.clone().to(torch.float32)
+            scheduler.timesteps = sigmas.clone().to(torch.float32)
         except Exception:
             pass
         return sched, sigmas
 
-    # ---- OFFICIAL-style get_sigmas(t) (copied semantics) ----
+    # OFFICIAL-style get_sigmas(t)
     def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
         sigmas = self.noise_scheduler_copy.sigmas.to(device=self.device, dtype=dtype)
         schedule_timesteps = self.noise_scheduler_copy.timesteps.to(self.device)
@@ -575,6 +694,33 @@ class CatVTON_SD3_Trainer:
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
         return sigma
+
+    # ---------- NEW: unified conversion helper ----------
+    @staticmethod
+    def _raw_to_eps_x0(raw: torch.Tensor, z_t: torch.Tensor, sigma4: torch.Tensor, pred_type: str):
+        """
+        Convert raw model output to (epsilon, x0) consistently for FM schedulers.
+        raw      : [B,C,H,W] model output
+        z_t      : [B,C,H,W] current noisy latents x_t
+        sigma4   : [B,1,1,1] sigma broadcast tensor
+        pred_type: 'epsilon' or 'x0'/'sample'. 'v_prediction' is intentionally not wired.
+        """
+        pt = str(pred_type).lower()
+        if pt == "epsilon":
+            eps = raw.float()
+            x0  = z_t.float() - sigma4.float() * eps
+            return eps, x0
+        if pt in ("x0", "sample"):
+            x0  = raw.float()
+            eps = (z_t.float() - x0) / sigma4.clamp_min(1e-8).float()
+            return eps, x0
+        if pt in ("v_prediction", "v-pred", "v"):
+            # Safer to fail than silently be wrong; SD3.5 FM usually does not use v-pred.
+            raise NotImplementedError("v_prediction mapping is model/scheduler-specific. Use 'epsilon' or 'sample(x0)'.")
+        # default fallback: treat as epsilon
+        eps = raw.float()
+        x0  = z_t.float() - sigma4.float() * eps
+        return eps, x0
 
     # ---------------- preview / inference ----------------
     @torch.no_grad()
@@ -599,91 +745,91 @@ class CatVTON_SD3_Trainer:
 
     @torch.no_grad()
     def _preview_sample(
-        self, batch, num_steps: int, global_step: int = 0,
-        Xi_override: torch.Tensor = None,
-        noise_override: torch.Tensor = None,
+        self,
+        num_steps: int,
+        start_latents: torch.Tensor,         # ← 시작 latent를 명시: Xi_lat 또는 z0_lat
+        pixels_for_keep: torch.Tensor,       # ← 합성에 쓸 픽셀: x_in 또는 x_gt
+        m: torch.Tensor,                     # [B,1,H,2W]
+        shared_noise: Optional[torch.Tensor] = None,
         start_idx_override: Optional[int] = None,
     ):
         H, W = self.cfg.size_h, self.cfg.size_w
-        x_in = batch["x_concat_in"].to(self.device, self.dtype)
-        m    = batch["m_concat"].to(self.device, self.dtype)
+        device = self.device
+        dtype  = self.dtype
 
-        Xi = (Xi_override.to(self.dtype)
-            if Xi_override is not None
-            else self._encode_vae_latents(x_in, generator=self._preview_gen, sample=True).to(self.dtype))
-        Mi = F.interpolate(m, size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor), mode="nearest").to(self.dtype)
-        K  = Mi.float()
-        B = Xi.shape[0]
+        # 마스크를 latent 해상도로
+        Mi = F.interpolate(
+            m.to(device, dtype),
+            size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor),
+            mode="nearest"
+        ).float()
+        K = Mi
+        B = start_latents.shape[0]
 
+        # 스케줄러/시그마 설정
         sched_full = FM.from_config(self.scheduler.config)
         _, sigmas_full = self._ensure_fm_sigmas(sched_full, max(2, int(num_steps)))
         if sigmas_full.numel() < 2:
-            return self._denorm(x_in)
+            return torch.clamp((pixels_for_keep.to(device, dtype) + 1.0) * 0.5, 0.0, 1.0)
 
-        if start_idx_override is not None:
-            start_idx = int(start_idx_override)
-        else:
+        if start_idx_override is None:
             s = max(0.0, min(1.0, float(self.cfg.preview_strength)))
             N = sigmas_full.numel() - 1
             start_idx = min(max(int((1.0 - s) * N), 0), sigmas_full.numel() - 2)
-
-        sched, sigmas = self._build_preview_scheduler(num_steps, start_idx)
-        is_strength_max = (float(self.cfg.preview_strength) >= 1.0 - 1e-8)
-
-        noise = (noise_override
-            if noise_override is not None
-            else torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=self._preview_gen))
-
-        if is_strength_max:
-            z = noise.float()
         else:
-            sigma0 = sigmas[0].to(Xi.device, torch.float32)
-            z = sched.scale_noise(Xi.float(), sigma0[None], noise).float()
+            start_idx = int(start_idx_override)
 
+        sched, timesteps = self._build_preview_scheduler(num_steps, start_idx)
+
+        # 공유 노이즈
+        if shared_noise is None:
+            shared_noise = torch.randn_like(start_latents, dtype=torch.float32, device=device, generator=self._preview_gen)
+
+        # 시작 latent는 호출자가 넘긴 값(start_latents)을 사용
+        sigma0 = timesteps[0].to(device, torch.float32)
+        start_noisy = sched.scale_noise(start_latents.float(), sigma0[None], shared_noise).float()
+        z = K * start_noisy + (1.0 - K) * (sigma0 * shared_noise).float()
+
+        # 프롬프트 임베딩
         prompt_embeds, pooled = self._encode_prompts(B)
         model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
 
         was_train = model.training
         model.eval()
         try:
-            timesteps = getattr(sched, "sigmas", getattr(sched, "timesteps"))
-            n_steps = int(timesteps.numel() - 1)
-            for i in range(n_steps):
-                sigma_t   = timesteps[i].to(Xi.device, torch.float32)
-                sigma_t_b = sigma_t.repeat(B)                 # [B]
-                sigma4 = sigma_t.view(1,1,1,1).expand(B,1,1,1).float()  # [B,1,1,1]
+            pred_type = str(getattr(self.scheduler.config, "prediction_type", "epsilon")).lower()
+            for i in range(int(timesteps.numel() - 1)):
+                sigma_t   = timesteps[i].to(device, torch.float32)
+                sigma_t_b = sigma_t.repeat(B)
+                sigma4    = sigma_t.view(1,1,1,1).expand(B,1,1,1).float()
 
                 z_in = self._fm_scale(z, sigma_t_b)
-
-                with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type=='cuda')):                    
+                with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=(device.type=='cuda')):
                     raw = model(
-                        hidden_states=z_in.to(self.dtype),
+                        hidden_states=z_in.to(dtype),
                         timestep=sigma_t_b,
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled,
                         return_dict=True,
                     ).sample.float()
 
-                    x0_pred = raw * (-sigma4) + z.float()
-                    if self.scheduler.config.prediction_type == "epsilon":
-                        eps_pred = (z.float() - x0_pred) / sigma4
-                    elif self.scheduler.config.prediction_type in ("sample", "x0"):
-                        eps_pred = x0_pred
-                    else:
-                        eps_pred = raw
+                # raw를 ε/x0로 동시 변환하고, 스케줄러가 기대하는 쪽을 넘긴다.
+                eps_pred, x0_pred = self._raw_to_eps_x0(raw, z, sigma4, pred_type)
+                model_output_for_step = eps_pred if pred_type == "epsilon" else x0_pred
 
-                z = sched.step(eps_pred, sigma_t, z).prev_sample.float()
+                z = sched.step(model_output_for_step, sigma_t, z).prev_sample.float()
 
-                # official inpaint recomposition
-                sigma_next = timesteps[i + 1].to(Xi.device, torch.float32)
-                init_latents_proper = sched.scale_noise(Xi.float(), sigma_next[None], noise).float()
+                # inpaint recomposition (동일)
+                sigma_next = timesteps[i + 1].to(device, torch.float32)
+                init_latents_proper = sched.scale_noise(start_latents.float(), sigma_next[None], shared_noise).float()
                 z = K * init_latents_proper + (1.0 - K) * z
 
-            # decode & final pixel recomposition
-            x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
-            K3_keep = m.repeat(1, 3, 1, 1)
-            x_final = K3_keep * x_in + (1.0 - K3_keep) * x_hat
-            return torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+            # 디코드 + 픽셀 합성
+            x_hat = from_latent_sd3(self.vae, z.to(dtype))
+            K3_keep = m.to(device, dtype).repeat(1, 3, 1, 1)
+            x_final = K3_keep * pixels_for_keep.to(device, dtype) + (1.0 - K3_keep) * x_hat
+            x_final = torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+            return x_final
         finally:
             if was_train:
                 model.train()
@@ -716,12 +862,9 @@ class CatVTON_SD3_Trainer:
             pass
 
         noise = torch.randn(Xi.shape, dtype=torch.float32, device=Xi.device, generator=gen)
-        is_strength_max = (float(self.cfg.preview_strength) >= 1.0 - 1e-8)
-        if is_strength_max:
-            z = noise.float()
-        else:
-            s0 = sigmas[0].to(Xi.device, torch.float32)
-            z = sched.scale_noise(Xi.float(), s0[None], noise).float()
+        s0 = sigmas[0].to(Xi.device, torch.float32)
+        Xi_noisy0 = sched.scale_noise(Xi.float(), s0[None], noise).float()
+        z = K * Xi_noisy0 + (1.0 - K) * (s0 * noise).float()
 
         prompt_embeds, pooled = self._encode_prompts(B)
         model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
@@ -730,13 +873,13 @@ class CatVTON_SD3_Trainer:
         model.eval()
         try:
             timesteps = sched.sigmas
+            pred_type = str(getattr(self.scheduler.config, "prediction_type", "epsilon")).lower()
             for i in range(timesteps.numel() - 1):
                 sigma_t   = timesteps[i].to(Xi)
-                sigma_t_b = sigma_t.repeat(B)                                # [B]
-                sigma4    = sigma_t.view(1,1,1,1).expand(B,1,1,1).float()    # [B,1,1,1]                
+                sigma_t_b = sigma_t.repeat(B)
+                sigma4    = sigma_t.view(1,1,1,1).expand(B,1,1,1).float()
 
                 z_in = self._fm_scale(z, sigma_t_b)
-
                 with torch.amp.autocast(device_type="cuda", dtype=self.dtype, enabled=(device.type == "cuda")):
                     raw = model(
                         hidden_states=z_in.to(self.dtype),
@@ -746,16 +889,12 @@ class CatVTON_SD3_Trainer:
                         return_dict=True,
                     ).sample.float()
 
-                x0_pred = raw * (-sigma4) + z.float()
-                if self.scheduler.config.prediction_type == "epsilon":
-                    eps_pred = (z.float() - x0_pred) / sigma4
-                elif self.scheduler.config.prediction_type in ("sample", "x0"):
-                    eps_pred = x0_pred
-                else:
-                    eps_pred = raw
+                eps_pred, x0_pred = self._raw_to_eps_x0(raw, z, sigma4, pred_type)
+                model_output_for_step = eps_pred if pred_type == "epsilon" else x0_pred
 
-                z = sched.step(eps_pred, sigma_t, z).prev_sample.float()                
+                z = sched.step(model_output_for_step, sigma_t, z).prev_sample.float()
 
+                # inpaint recomposition (동일)
                 sigma_next = timesteps[i + 1].to(Xi, torch.float32)
                 init_latents_proper = sched.scale_noise(Xi.float(), sigma_next[None], noise).float()
                 z = K * init_latents_proper + (1.0 - K) * z
@@ -763,10 +902,11 @@ class CatVTON_SD3_Trainer:
             x_hat = from_latent_sd3(self.vae, z.to(self.dtype))
             K3_keep = m.repeat(1, 3, 1, 1)
             x_final = K3_keep * x_in + (1.0 - K3_keep) * x_hat
-            save_image(make_grid(x_final.clamp(-1,1).add(1).mul(0.5).cpu(), nrow=1), out_path)
+            x_final = torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+            save_image(make_grid(x_final.cpu(), nrow=1), out_path)
             if hasattr(self, "logger"):
                 self.logger.info(f"[infer] saved inference to {out_path}")
-            return torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
+            return x_final
         finally:
             if was_train:
                 model.train()
@@ -812,7 +952,7 @@ class CatVTON_SD3_Trainer:
         x_gt = batch["x_concat_gt"][:rows].to(self.device, self.dtype)
         m    = batch["m_concat"][:rows].to(self.device, self.dtype)
         if any(t.shape[0] == 0 for t in [x_in, x_gt, m]):
-            return
+            return        
 
         if not self._mask_keep_logged:
             keep_ratio = (m[:, :, :, : m.shape[-1] // 2].float().mean().item())
@@ -830,43 +970,50 @@ class CatVTON_SD3_Trainer:
         z0_lat = self._encode_vae_latents(x_gt, generator=self._preview_gen, sample=True).to(self.dtype)
         sigma0 = sigmas_probe[0].to(Xi_lat.device, torch.float32)
         shared_noise = torch.randn(Xi_lat.shape, dtype=torch.float32, device=Xi_lat.device, generator=self._preview_gen)
-        z_init = shared_noise if s >= 1.0 - 1e-8 else sched_probe.scale_noise(Xi_lat.float(), sigma0[None], shared_noise).float()
-        xi_noisy_img = from_latent_sd3(self.vae, z_init.to(self.dtype))
+
+        Mi = F.interpolate(
+            m, size=(self.cfg.size_h // self.vae_scale_factor, (2 * self.cfg.size_w) // self.vae_scale_factor),
+            mode="nearest"
+        ).float()
+        Xi_noisy0 = sched_probe.scale_noise(Xi_lat.float(), sigma0[None], shared_noise).float()
+        
+        z_init_vis = Mi * Xi_noisy0 + (1.0 - Mi) * (sigma0 * shared_noise)
+        xi_noisy_img = from_latent_sd3(self.vae, z_init_vis.to(self.dtype))
         xi_noisy_img = torch.clamp((xi_noisy_img + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
 
-        pred_img_final = self._preview_sample(
-            {"x_concat_in": x_in, "m_concat": m},
+        # 두 가지 프리뷰(입력 합성, GT 합성) 받기
+        preview_from_input = self._preview_sample(
             num_steps=num_steps,
-            global_step=global_step,
-            Xi_override=Xi_lat.float(),
-            noise_override=shared_noise,
+            start_latents=Xi_lat.float(),
+            pixels_for_keep=x_in,
+            m=m,
+            shared_noise=shared_noise,
             start_idx_override=start_idx,
         )
 
-        # For comparison; optional 1-step TF panel can be kept or removed.
-        # (kept here to preserve user's preview layout expectations)
+        # (B) GT(latents=z0)로부터 시작, GT 픽셀과 합성 → preview(GT)
+        preview_from_gt = self._preview_sample(
+            num_steps=num_steps,
+            start_latents=z0_lat.float(),
+            pixels_for_keep=x_gt,
+            m=m,
+            shared_noise=shared_noise,
+            start_idx_override=start_idx,
+        )
+
+        # 원스텝 진단
         with torch.no_grad():
             B = Xi_lat.shape[0]
-            sigma_b = sigma0.expand(B)                                    # [B]
-            sigma4  = sigma0.view(1,1,1,1).expand(B,1,1,1).float()        # [B,1,1,1]
-
-            Mi = F.interpolate(
-                m, size=(self.cfg.size_h // self.vae_scale_factor, (2 * self.cfg.size_w) // self.vae_scale_factor),
-                mode="nearest"
-            ).float()
-
-            Xi_noisy = sched_probe.scale_noise(Xi_lat.float(), sigma0[None], shared_noise)
-            z0_noisy = sched_probe.scale_noise(z0_lat.float(), sigma0[None], shared_noise)
-
-            # 학습과 동일한 인페인트 입력 구성: KEEP=Mi → Xi_noisy, HOLE=1-Mi → z0_noisy
-            x_t = Mi * Xi_noisy + (1.0 - Mi) * z0_noisy
+            sigma_b = sigma0.expand(B)
+            sigma4  = sigma0.view(1,1,1,1).expand(B,1,1,1).float()
+            x_t = Mi * Xi_noisy0 + (1.0 - Mi) * (sigma0 * shared_noise)
 
             prompt_embeds, pooled = self._encode_prompts(B)
             model = self.transformer.module if isinstance(self.transformer, DDP) else self.transformer
+            was_train = model.training
+            model.eval()
 
-            # ★ SD3 FlowMatch 입력 스케일링
             x_t_scaled = self._fm_scale(x_t, sigma_b)
-
             raw = model(
                 hidden_states=x_t_scaled.to(self.dtype),
                 timestep=sigma_b,
@@ -875,12 +1022,13 @@ class CatVTON_SD3_Trainer:
                 return_dict=True
             ).sample.float()
 
-            # precondition_outputs=1 기준 복원 (raw는 v, x0는 원본 x_t 기준으로 복원)
-            x0_pred = raw * (-sigma4) + x_t.float()
+            pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
+            _, x0_pred = self._raw_to_eps_x0(raw, x_t, sigma4, pred_type)
 
             x_hat = from_latent_sd3(self.vae, x0_pred.to(self.dtype))
             K3 = m.repeat(1, 3, 1, 1)
-            one_step_img = torch.clamp((K3 * x_in + (1.0 - K3) * x_hat + 1.0) * 0.5, 0, 1).cpu()
+            one_step_img = torch.clamp((K3 * x_gt + (1.0 - K3) * x_hat + 1.0) * 0.5, 0, 1).cpu()
+
 
         _, _, Hh, WW = x_gt.shape
         Ww = WW // 2
@@ -893,14 +1041,15 @@ class CatVTON_SD3_Trainer:
         def _cpu32(t): return t.detach().to('cpu', dtype=torch.float32, non_blocking=True).contiguous()
 
         tiles_and_names = [
-            (_cpu32(self._denorm(person))   , "person"),
-            (_cpu32(mask_vis)               , "mask_vis"),
-            (_cpu32(self._denorm(masked_person)), "masked_person"),
-            (_cpu32(self._denorm(garment))  , "garment"),
-            (xi_noisy_img                   , "Xi + noise"),
-            (_cpu32(self._denorm(x_gt))     , "GT pair"),
-            (pred_img_final                 , "preview"),
-            (one_step_img                   , "1-step TF"),
+            (_cpu32(self._denorm(person))         , "person"),
+            (_cpu32(mask_vis)                     , "mask_vis"),
+            (_cpu32(self._denorm(masked_person))  , "masked_person"),
+            (_cpu32(self._denorm(garment))        , "garment"),
+            (xi_noisy_img                         , "Xi + noise"),
+            (_cpu32(self._denorm(x_gt))           , "GT pair"),
+            (preview_from_input                   , "preview(in)"),
+            (preview_from_gt                      , "preview(GT)"),
+            (one_step_img                         , "1-step TF"),
         ]
 
         cols = [t for (t, _) in tiles_and_names]
@@ -914,8 +1063,37 @@ class CatVTON_SD3_Trainer:
         final_img = torch.cat([grid, bottom], dim=1)
 
         out_path = os.path.join(self.img_dir, f"step_{global_step:06d}.png")
+
+        with torch.no_grad():
+            hole = (1.0 - m).to(preview_from_input)          # [B,1,H,2W]
+            hole3 = hole.repeat(1,3,1,1)
+
+            # 1) 출력 민감도: 두 경로 출력 차이(같은 노이즈, 다른 start_latents) - HOLE만
+            diff_out = ((preview_from_input - preview_from_gt) * hole3).pow(2).sum(dim=(1,2,3))
+            denom_out = hole3.sum(dim=(1,2,3)).clamp_min(1.0)
+            mse_out_hole = (diff_out / denom_out).mean()
+
+            # 2) 초기(스텝0) KEEP영역에서의 시작 차이 크기
+            #   Xi_noisy0와 z0_noisy0를 같은 shared_noise로 만든 뒤 KEEP에서 차이 측정
+            Xi_noisy0 = sched_probe.scale_noise(Xi_lat.float(), sigma0[None], shared_noise).float()
+            z0_noisy0 = sched_probe.scale_noise(z0_lat.float(), sigma0[None], shared_noise).float()
+            keep_lat_mask = Mi  # latent 해상도의 KEEP
+            init_keep_delta = ((keep_lat_mask * (Xi_noisy0 - z0_noisy0)).pow(2)).mean()
+
+            # 3) 출력 민감도 / 입력차 분모 (rough sensitivity)
+            sens = (mse_out_hole / (init_keep_delta + 1e-8)).item()
+
+            # 로그/TF
+            self.tb.add_scalar("debug/preview_hole_mse", float(mse_out_hole), global_step)
+            self.tb.add_scalar("debug/init_keep_delta",  float(init_keep_delta), global_step)
+            self.tb.add_scalar("debug/output_sensitivity", sens, global_step)
+            if hasattr(self, "logger"):
+                self.logger.info(f"[probe] hole_mse={float(mse_out_hole):.5f} | "
+                                f"init_keep_delta={float(init_keep_delta):.5f} | sens={sens:.3f}")
+
         save_image(final_img, out_path)
         self.logger.info(f"[img] saved preview at step {global_step}: {out_path}")
+
 
     @torch.no_grad()
     def _encode_vae_latents(self, x: torch.Tensor, generator: Optional[torch.Generator] = None, sample: bool = True):
@@ -929,24 +1107,28 @@ class CatVTON_SD3_Trainer:
     # ---------------- training core ----------------
     def step(self, batch, global_step: int):
         H, W = self.cfg.size_h, self.cfg.size_w
+
+        # 입/정답/마스크 모두 사용
         x_concat_in = batch["x_concat_in"].to(self.device, self.dtype)
         x_concat_gt = batch["x_concat_gt"].to(self.device, self.dtype)
         m_concat    = batch["m_concat"].to(self.device, self.dtype)
 
         with torch.no_grad():
-            Xi = self._encode_vae_latents(x_concat_in, generator=None, sample=True).to(self.dtype)
-            z0 = self._encode_vae_latents(x_concat_gt, generator=None, sample=True).to(self.dtype)
+            # VAE 인코딩
+            z0 = self._encode_vae_latents(x_concat_gt, generator=None, sample=True).to(self.dtype)  # target x0
+            Xi = self._encode_vae_latents(x_concat_in, generator=None, sample=True).to(self.dtype)  # inpaint input
+
+            # KEEP 마스크를 latent 해상도로 (Mi=1 KEEP, Mi=0 HOLE)
             Mi = F.interpolate(
                 m_concat,
                 size=(H // self.vae_scale_factor, (2 * W) // self.vae_scale_factor),
                 mode="nearest",
             ).to(self.dtype)
 
-        # ---- 공식 SD3 변수 흐름 동일 ----
-        model_input = z0.float()
-        noise = torch.randn_like(model_input)
-        bsz = model_input.shape[0]
+        bsz = z0.shape[0]
+        noise = torch.randn_like(z0, dtype=torch.float32)
 
+        # SD3 공식: u→indices→timesteps
         u = compute_density_for_timestep_sampling(
             weighting_scheme=self.cfg.weighting_scheme,
             batch_size=bsz,
@@ -954,61 +1136,87 @@ class CatVTON_SD3_Trainer:
             logit_std=self.cfg.logit_std,
             mode_scale=self.cfg.mode_scale,
         )
-        indices   = (u * self.noise_scheduler_copy.config.num_train_timesteps).long()
-        timesteps = self.noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
-        sigmas    = self.get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+        num_tt = int(self.train_scheduler.timesteps.numel() - 1)
+        indices = (u * num_tt).long().clamp_(0, num_tt - 1)
+        timesteps = self.train_scheduler.timesteps[indices].to(device=z0.device, dtype=torch.float32)
+        sigma_1d  = self.train_scheduler.sigmas[indices].to(device=z0.device, dtype=torch.float32)
+        sigma4    = sigma_1d.view(-1, 1, 1, 1)  # [B,1,1,1]
 
-        z0_noisy = (1.0 - sigmas) * model_input + sigmas * noise   # z0의 noisy 버전
-        noisy_Xi = (1.0 - sigmas) * Xi.float() + sigmas * noise    # Xi의 noisy 버전
-        noisy_model_input = Mi.float() * noisy_Xi + (1.0 - Mi.float()) * z0_noisy
+        if self.is_main and global_step == 0:
+            print("sched(sigmas)[:3] =", self.train_scheduler.sigmas[:3].float().cpu().tolist())
+            print("sigma_1d[:3]      =", sigma_1d[:3].float().cpu().tolist())
+            print("prediction_type =", self.train_scheduler.config.prediction_type)            
+            self.logger.info(f"sched(sigmas)[:3] = {self.train_scheduler.sigmas[:3].float().cpu().tolist()}")
+            self.logger.info(f"fsigma_1d[:3]     = {sigma_1d[:3].float().cpu().tolist()}")
+            self.logger.info(f"prediction_type   = {self.train_scheduler.config.prediction_type}")
 
-        hs = self._fm_scale(noisy_model_input, sigmas)
 
+        # 둘 다 같은 noise로 re-noise
+        z0_noisy = self.train_scheduler.scale_noise(z0.float(), sigma_1d, noise.float()).float()
+        Xi_noisy = self.train_scheduler.scale_noise(Xi.float(), sigma_1d, noise.float()).float()
+
+        # **진짜 학습 입력**: inpaint 분포와 동일하게 섞기 (KEEP=Mi)
+        # noisy_model_input = Mi * Xi_noisy + (1.0 - Mi) * z0_noisy
+        
+        # inference와 동일하게 섞기
+        sigma4 = sigma_1d.view(-1, 1, 1, 1)  # [B,1,1,1]
+        noisy_model_input = Mi * Xi_noisy + (1.0 - Mi) * (sigma4 * noise.float())
+
+        # FM 입력 스케일링        
+        hs = self._fm_scale(noisy_model_input, sigma_1d)
+
+        # 프롬프트 임베딩
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(bsz)
 
+        # 모델 추론
         with torch.amp.autocast(device_type='cuda', dtype=self.dtype, enabled=(self.device.type == 'cuda')):
-            model = self.transformer            
-            model_pred = model(
+            raw_out = self.transformer(
                 hidden_states=hs.to(self.dtype),
-                timestep=timesteps,
+                timestep=timesteps,  # FM에서는 sigma를 바로 timestep으로 사용
                 encoder_hidden_states=prompt_embeds,
                 pooled_projections=pooled_prompt_embeds,
                 return_dict=False,
-            )[0]
+            )[0].float()
 
-        if int(self.cfg.precondition_outputs) == 1:
-            model_pred = model_pred * (-sigmas) + noisy_model_input
+        # raw → (ε, x0) 변환할 때 **z_t는 방금 모델에 넣은 noisy_model_input**을 사용해야 함
+        pred_type = str(getattr(self.train_scheduler.config, "prediction_type", "epsilon")).lower()
+        _, x0_pred = self._raw_to_eps_x0(raw_out, noisy_model_input.float(), sigma4, pred_type)
 
-        weighting = compute_loss_weighting_for_sd3(
-            weighting_scheme=self.cfg.weighting_scheme, sigmas=sigmas
-        )
 
-        if int(self.cfg.precondition_outputs) == 1:
-            target = model_input
+        if getattr(self.cfg, "loss_sigma_weight", False):
+            weighting = compute_loss_weighting_for_sd3(weighting_scheme=self.cfg.weighting_scheme, sigmas=sigma_1d)
         else:
-            target = noise - model_input
+            weighting = torch.ones_like(sigma_1d)
 
-        # ---------- 여기부터 HOLE-ONLY 손실 ----------
-        # HOLE = 1 - Mi (latent 해상도 기준), 채널까지 브로드캐스트
-        Hmask = (1.0 - Mi).float()              # [B,1,h,2w]
-        C = model_input.shape[1]
+        # 타깃은 GT의 x0 (z0), 손실은 HOLE만
+        target = z0.float()
+        Hmask = (1.0 - Mi).float()  # HOLE-only
+        C = target.shape[1]
 
-        per_elem = weighting.float() * (model_pred.float() - target.float())**2
-        masked   = per_elem * Hmask             # [B,C,h,2w]
+        diff2 = (x0_pred - target) ** 2
+        per_elem = weighting.view(-1,1,1,1).float() * diff2
+        masked = per_elem * Hmask
 
-        # 샘플별 면적 정규화(공식 구현의 per-sample mean에 대응)
         B = masked.shape[0]
-        masked_flat   = masked.view(B, -1).sum(dim=1)           # [B]
-        denom_flat    = (Hmask.view(B, -1).sum(dim=1) * C).clamp_min(1.0)  # [B]
-        loss_per_sample = masked_flat / denom_flat              # [B]
+        masked_flat = masked.view(B, -1).sum(dim=1)
+        denom_flat = (Hmask.view(B, -1).sum(dim=1) * C).clamp_min(1.0)
+        loss_per_sample = masked_flat / denom_flat
         loss = loss_per_sample.mean()
-        # ---------- 여기까지 ----------
+
+        dbg = {
+            "sigma_min": float(sigma_1d.min()),
+            "sigma_max": float(sigma_1d.max()),
+            "w_mean": float(weighting.mean()),
+            "unweighted_mse": float(((diff2 * Hmask).view(B,-1).sum(dim=1) / denom_flat).mean()),
+            "var_x0": float(target.pow(2).mean()),
+            "hole_ratio": float(Mi[:, :, :, : Mi.shape[-1] // 2].float().mean()),
+        }
 
         if (not torch.isfinite(loss)) or (not loss.requires_grad):
             return None
+        return loss, dbg
 
-        loss_val = float(loss.detach().cpu())
-        return (loss, loss_val, loss_val, loss_val, loss_val)
+
 
     def _save_ckpt(self, epoch: int, train_loss_epoch: float, global_step: int) -> str:
         ckpt_path = os.path.join(self.model_dir, f"epoch_{epoch}_loss_{train_loss_epoch:.04f}.ckpt")
@@ -1073,21 +1281,23 @@ class CatVTON_SD3_Trainer:
         if self.is_dist and self.sampler is not None:
             self.sampler.set_epoch(epoch)
 
-        comp_eps_sum = comp_lat_sum = comp_keep_sum = comp_gar_sum = 0.0
-
         while global_step < self.cfg.max_steps:
             self.optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
-            comp_eps_accum = comp_lat_accum = comp_keep_accum = comp_gar_accum = 0.0
+            dbg_acc = {
+                "sigma_min": 0.0, "sigma_max": 0.0, "w_mean": 0.0,
+                "unweighted_mse": 0.0, "var_x0": 0.0, "hole_ratio": 0.0
+            }
             nonfinite = False
             reason = ""
+          
 
             for _ in range(self.cfg.grad_accum):
                 batch = next(data_iter)
                 out = self.step(batch, global_step)
-                if (out is None):
+                if out is None:
                     nonfinite = True; reason = "None/NaN in forward"; break
-                (loss, l1, l2, l3, l4) = out
+                loss, dbg = out
 
                 if (not torch.isfinite(loss)) or (not loss.requires_grad):
                     nonfinite = True; reason = "non-finite/detached loss"; break
@@ -1098,10 +1308,8 @@ class CatVTON_SD3_Trainer:
                     loss.backward()
 
                 loss_accum += float(loss.detach().cpu())
-                comp_eps_accum  += float(l1)
-                comp_lat_accum  += float(l2)
-                comp_keep_accum += float(l3)
-                comp_gar_accum  += float(l4)
+                for k in dbg_acc.keys():
+                    dbg_acc[k] += float(dbg[k])            
 
             if nonfinite:
                 msg = f"[warn] skipping step {global_step}: {reason}."
@@ -1131,31 +1339,27 @@ class CatVTON_SD3_Trainer:
 
             self._epoch_loss_sum += loss_accum / max(1, self.cfg.grad_accum)
             self._epoch_loss_count += 1
-            comp_eps_sum  += comp_eps_accum  / max(1, self.cfg.grad_accum)
-            comp_lat_sum  += comp_lat_accum  / max(1, self.cfg.grad_accum)
-            comp_keep_sum += comp_keep_accum / max(1, self.cfg.grad_accum)
-            comp_gar_sum  += comp_gar_accum  / max(1, self.cfg.grad_accum)
-
             train_loss_avg = self._epoch_loss_sum / max(1, self._epoch_loss_count)
-            loss_eps_avg   = comp_eps_sum / max(1, self._epoch_loss_count)
-            loss_lat_avg   = comp_lat_sum / max(1, self._epoch_loss_count)
-            loss_keep_avg  = comp_keep_sum / max(1, self._epoch_loss_count)
-            loss_gar_avg   = comp_gar_sum / max(1, self._epoch_loss_count)
+
+            denom = float(max(1, self.cfg.grad_accum))
+            dbg_avg = {k: v / denom for k, v in dbg_acc.items()}
 
             if self.is_main and ((global_step % self.cfg.log_every) == 0 or global_step == 1):
                 self.tb.add_scalar("train/loss_total", train_loss_avg, global_step)
-                # keep legacy scalars for continuity; they mirror total now
-                self.tb.add_scalar("train/loss_eps",   loss_eps_avg,   global_step)
-                self.tb.add_scalar("train/loss_lat",   loss_lat_avg,   global_step)
-                self.tb.add_scalar("train/loss_keep",  loss_keep_avg,  global_step)
-                self.tb.add_scalar("train/loss_gar",   loss_gar_avg,   global_step)
                 self.tb.add_scalar("train/grad_norm_transformer", tf_grad_norm, global_step)
 
                 prog = (global_step % self.steps_per_epoch) / self.steps_per_epoch if self.steps_per_epoch > 0 else 0.0
                 pct = int(prog * 100)
-                line = (f"Epoch {epoch}: {pct:3d}% | step {global_step}/{self.cfg.max_steps} "
-                        f"| total={train_loss_avg:.4f}")
-                pbar.set_postfix_str(f"tot={train_loss_avg:.4f}")
+                line = (
+                    f"Epoch {epoch}: {pct:3d}% | step {global_step}/{self.cfg.max_steps} "
+                    f"| loss={train_loss_avg:.4f} "
+                    f"| sigma[min,max]=[{dbg_avg['sigma_min']:.3f},{dbg_avg['sigma_max']:.3f}] "
+                    f"| w_mean={dbg_avg['w_mean']:.4f} "
+                    f"| unw_mse={dbg_avg['unweighted_mse']:.4f} "
+                    f"| var_x0={dbg_avg['var_x0']:.4f} "
+                    f"| hole={dbg_avg['hole_ratio']:.3f}"
+                )
+                pbar.set_postfix_str(f"loss={train_loss_avg:.4f}")
                 pbar.write(line); self.logger.info(line)
 
             if self.is_dist:
@@ -1180,7 +1384,6 @@ class CatVTON_SD3_Trainer:
                     pbar.write(f"[save-epoch] {path}")
                 self._epoch_loss_sum = 0.0
                 self._epoch_loss_count = 0
-                comp_eps_sum = comp_lat_sum = comp_keep_sum = comp_gar_sum = 0.0
                 if self.is_main:
                     pbar.set_description(f"Epoch {epoch}")
                 if self.is_dist and self.sampler is not None:
@@ -1198,6 +1401,7 @@ class CatVTON_SD3_Trainer:
             dist.barrier()
 
 
+
 # ------------------------------------------------------------
 # CLI / Config
 # ------------------------------------------------------------
@@ -1210,11 +1414,11 @@ DEFAULTS = {
     "lr": 5e-5,
     "batch_size": 8, "grad_accum": 1, "max_steps": 128000,
     "seed": 1337, "num_workers": 4,
-    "mixed_precision": "fp16",           # fp16 (good default), or bf16 on Ampere+/Hopper, or fp32 for debugging
+    "mixed_precision": "fp16",
     "use_scaler": True,
 
     "prefer_xformers": True,
-    "disable_text": True,                # we still pull uncond embeds; no text conditioning from user
+    "disable_text": False,
     "save_root_dir": "logs", "save_name": "catvton_sd35_inpaint",
     "log_every": 50, "image_every": 500,
     "save_epoch_ckpt": 15,
@@ -1226,7 +1430,6 @@ DEFAULTS = {
     "logit_mean": 0.0,
     "logit_std": 1.0,
     "mode_scale": 1.29,
-    "precondition_outputs": 1,           # match official default
 
     # preview
     "preview_infer_steps": 60,
@@ -1234,6 +1437,10 @@ DEFAULTS = {
     "preview_strength": 0.3,
     "preview_rows" : 4,
     "preview_caption_h": 28,
+
+    # 추가: 고정 프롬프트
+    "fixed_prompt": None,          # None면 기본 문구 사용    
+    "disable_dynamic_shifting": True,  # 2W concat 입력에서 기본적으로 끔
 
     # runtime
     "hf_token": None,
@@ -1270,12 +1477,15 @@ def parse_args():
     p.add_argument("--preview_seed", type=int, default=None)
     p.add_argument("--resume_ckpt", type=str, default=None)
 
-    # official SD3 knobs
     p.add_argument("--weighting_scheme", type=str, default=None, choices=["sigma_sqrt","logit_normal","mode","cosmap"])
     p.add_argument("--logit_mean", type=float, default=None)
     p.add_argument("--logit_std", type=float, default=None)
     p.add_argument("--mode_scale", type=float, default=None)
-    p.add_argument("--precondition_outputs", type=int, default=None)
+    
+    
+    # 고정 프롬프트
+    p.add_argument("--fixed_prompt", type=str, default=None)
+    p.add_argument("--disable_dynamic_shifting", action="store_true")
 
     return p.parse_args()
 
@@ -1309,6 +1519,10 @@ def load_merge_config(args: argparse.Namespace) -> DotDict:
     elif getattr(args, "disable_text", False):
         cfg["disable_text"] = True
 
+    # CLI 병합
+    if getattr(args, "fixed_prompt", None) is not None:
+        cfg["fixed_prompt"] = args.fixed_prompt    
+
     return DotDict(cfg)
 
 
@@ -1329,6 +1543,7 @@ def build_run_dirs(cfg: DotDict, run_name: Optional[str] = None, create: bool = 
     return paths
 
 
+# 수정후
 def main():
     args = parse_args()
     cfg = load_merge_config(args)
@@ -1344,6 +1559,10 @@ def main():
     run_name = bcast_object(run_name, src=0)
     run_dirs = build_run_dirs(cfg, run_name=run_name, create=(rank == 0))
 
+    # rank 0에서 현재 실행 스크립트 백업
+    if rank == 0:
+        _try_copy_running_script(run_dirs["run_dir"])
+
     cfg_yaml_to_save = dict(cfg) if rank == 0 else None
 
     trainer = CatVTON_SD3_Trainer(cfg, run_dirs, cfg_yaml_to_save=cfg_yaml_to_save)
@@ -1351,6 +1570,7 @@ def main():
 
     if is_dist:
         dist.destroy_process_group()
+
 
 
 if __name__ == "__main__":
