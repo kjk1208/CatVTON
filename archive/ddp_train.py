@@ -1,4 +1,4 @@
-# ddp_train_patched.py — SD3.5 CatVTON (DDP-ready) with train/infer sched split, v-pred, tighter attn-freeze, left-half loss weighting, and clearer logging
+# train.py  (YAML-first, no dataclass) — DDP-ready, FlowMatch-correct, preview/save/log only on rank 0
 import os
 import json
 import random
@@ -50,11 +50,10 @@ except Exception as e:
     ) from e
 
 try:
-    # ✅ train/infer scheduler split
-    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, DDPMScheduler
+    from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 except Exception as e:
     raise ImportError(
-        "Schedulers not found. Please update diffusers (>=0.34)."
+        "FlowMatchEulerDiscreteScheduler not found. Please update diffusers (>=0.29, preferably >=0.34)."
     ) from e
 
 from huggingface_hub import snapshot_download
@@ -194,6 +193,26 @@ class PairListDataset(Dataset):
 # ------------------------------------------------------------
 # SD3.5 helpers
 # ------------------------------------------------------------
+def load_sd3_components(model_id: str, device, dtype, token: str = None, revision: str = None):
+    """
+    (Unused in DDP path below; left for reference)
+    """
+    local_dir = snapshot_download(
+        repo_id=model_id, token=token, revision=revision,
+        resume_download=True, local_files_only=False,
+    )
+
+    pipe = StableDiffusion3Pipeline.from_pretrained(
+        local_dir, torch_dtype=dtype, local_files_only=True, use_safetensors=True,
+    ).to(device)
+
+    vae = pipe.vae
+    transformer: SD3Transformer2DModel = pipe.transformer
+    encode_prompt = pipe.encode_prompt
+    sched = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
+    return vae, transformer, encode_prompt, sched
+
+
 @torch.no_grad()
 def to_latent_sd3(vae, x_bchw: torch.Tensor) -> torch.Tensor:
     posterior = vae.encode(x_bchw).latent_dist
@@ -232,23 +251,15 @@ class ConcatProjector(nn.Module):
 
 
 def freeze_all_but_attn_sd3(transformer: SD3Transformer2DModel):
-    """Freeze everything then unfreeze self-attention only (exclude cross-attn)."""
     for p in transformer.parameters():
         p.requires_grad = False
-
-    allow_keys = ("attn", "to_q", "to_k", "to_v", "to_out")   # broad allow
-    exclude_keys = ("attn2", "cross")                         # common cross-attn tokens
-    matched = []
+    train_count = 0
     for name, module in transformer.named_modules():
-        if any(k in name for k in allow_keys) and not any(ek in name for ek in exclude_keys):
+        if ".attn" in name:
             for p in module.parameters():
                 p.requires_grad = True
-            matched.append(name)
-
-    real_trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-    if real_trainable == 0:
-        raise RuntimeError("No transformer params were unfrozen. Check patterns.")
-    return real_trainable, matched
+            train_count += sum(p.numel() for p in module.parameters())
+    return train_count
 
 
 # ------------------------------------------------------------
@@ -331,25 +342,7 @@ class CatVTON_SD3_Trainer:
         self.vae = pipe.vae
         self.transformer: SD3Transformer2DModel = pipe.transformer
         self.encode_prompt = pipe.encode_prompt
-
-        # ---- Inference scheduler (FlowMatch Euler) ----
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipe.scheduler.config)
-        pt = getattr(self.scheduler.config, "prediction_type", None)
-        if pt != "v_prediction":
-            self.scheduler.register_to_config(prediction_type="v_prediction")
-            if self.is_main:
-                self.logger.info(f"[sched] force prediction_type=v_prediction (was {pt})")
-        else:
-            if self.is_main:
-                self.logger.info("[sched] prediction_type=v_prediction")
-
-        # ✅ Training scheduler (DDPM) — used only for noise/target & scaling in training
-        self.train_scheduler = DDPMScheduler(
-            num_train_timesteps=1000,
-            beta_schedule="linear",
-            prediction_type="v_prediction"
-        )
-
         if self.is_main:
             self.logger.info(f"Loaded SD3 model: {cfg.sd3_model}")
 
@@ -377,7 +370,7 @@ class CatVTON_SD3_Trainer:
         self.projector = ConcatProjector(in_ch=33, out_ch=16).to(self.device, dtype=torch.float32)
 
         # freeze except attention (before DDP)
-        trainable_tf, matched_modules = freeze_all_but_attn_sd3(self.transformer)
+        trainable_tf = freeze_all_but_attn_sd3(self.transformer)
 
         # cast trainable(attn) params to FP32 when using fp16 training
         casted = 0
@@ -391,11 +384,9 @@ class CatVTON_SD3_Trainer:
         self.logger.info(msg)
 
         proj_params = sum(p.numel() for p in self.projector.parameters())
-        if self.is_main:
-            self.logger.info(f"[freeze] matched_modules={len(matched_modules)} (showing up to 8): "
-                             + ", ".join(matched_modules[:8]))
-            print(f"Trainable params (unique): transformer={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.4f}M")
-            self.logger.info(f"Trainable params (unique): transformer={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.4f}M")
+        msg = f"Trainable params: transformer-attn={trainable_tf/1e6:.2f}M, projector={proj_params/1e6:.2f}M"
+        if self.is_main: print(msg)
+        self.logger.info(msg)
 
         # data
         self.dataset = PairListDataset(
@@ -426,13 +417,9 @@ class CatVTON_SD3_Trainer:
 
         # AMP/GradScaler
         self.use_scaler = (self.device.type == "cuda") and (self.dtype == torch.float16)
-        if self.is_main:
-            print(f"[amp] dtype={self.dtype}, use_scaler={self.use_scaler}")
-        self.logger.info(f"[amp] dtype={self.dtype}, use_scaler={self.use_scaler}")
-
-        # flags for safe scaling
-        self._has_scale_model_input_infer = hasattr(self.scheduler, "scale_model_input")
-        self._has_scale_model_input_train = hasattr(self.train_scheduler, "scale_model_input")
+        msg = f"[amp] dtype={self.dtype}, use_scaler={self.use_scaler}"
+        if self.is_main: print(msg)
+        self.logger.info(msg)
 
         # DDP wrap (after freezing/casting)
         self.transformer = DDP(
@@ -452,6 +439,8 @@ class CatVTON_SD3_Trainer:
         self.optimizer = torch.optim.AdamW(
             optim_params, lr=cfg.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0
         )
+
+        self._has_scale_model_input = hasattr(self.scheduler, "scale_model_input")
 
         self._epoch_loss_sum = 0.0
         self._epoch_loss_count = 0
@@ -475,29 +464,27 @@ class CatVTON_SD3_Trainer:
     def _denorm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
 
-    # --- timesteps helpers (now scheduler-aware) ---
-    def _as_1d_timesteps(self, sample: torch.Tensor, t, B: int, scheduler) -> torch.Tensor:
+    # --- timesteps helpers ---
+    def _as_1d_timesteps(self, sample: torch.Tensor, t, B: int) -> torch.Tensor:
         if not torch.is_tensor(t):
             t = torch.tensor([t], device=sample.device)
         t = t.to(sample.device)
         if t.ndim == 0:
             t = t[None]
-        tdtype = getattr(scheduler, "timesteps", torch.tensor([], device=sample.device)).dtype \
-                 if hasattr(scheduler, "timesteps") else torch.long
+        tdtype = getattr(self.scheduler, "timesteps", torch.tensor([], device=sample.device)).dtype \
+                if hasattr(self.scheduler, "timesteps") else torch.long
         t = t.to(tdtype)
         if t.shape[0] != B:
             t = t[:1].repeat(B)
         return t
 
-    def _scale_model_input_safe(self, sample: torch.Tensor, timesteps, scheduler) -> torch.Tensor:
-        has_func = (scheduler is self.scheduler and self._has_scale_model_input_infer) or \
-                   (scheduler is self.train_scheduler and self._has_scale_model_input_train)
-        if not has_func:
+    def _scale_model_input_safe(self, sample: torch.Tensor, timesteps) -> torch.Tensor:
+        if not self._has_scale_model_input:
             return sample
         try:
             B = sample.shape[0]
-            t1d = self._as_1d_timesteps(sample, timesteps, B, scheduler)
-            return scheduler.scale_model_input(sample, t1d)
+            t1d = self._as_1d_timesteps(sample, timesteps, B)
+            return self.scheduler.scale_model_input(sample, t1d)
         except Exception as e:
             self.logger.info(f"[scale_model_input_safe] bypass: {e}")
             return sample
@@ -512,7 +499,7 @@ class CatVTON_SD3_Trainer:
         Mi = F.interpolate(m, size=(H // 8, (2 * W) // 8), mode="nearest").to(self.dtype)
         B, C, h, w = Xi.shape
 
-        # timesteps / init noise (inference scheduler)
+        # timesteps / init noise
         self.scheduler.set_timesteps(num_steps, device=self.device)
         sigma0 = float(getattr(self.scheduler, "init_noise_sigma",
                                self.scheduler.sigmas[0] if hasattr(self.scheduler, "sigmas") else 1.0))
@@ -523,9 +510,9 @@ class CatVTON_SD3_Trainer:
         prompt_embeds, pooled = self._encode_prompts(B)
 
         for t in self.scheduler.timesteps:
-            t1d = self._as_1d_timesteps(z, t, B, self.scheduler)  # (B,)
-            z_in  = self._scale_model_input_safe(z,  t1d, self.scheduler)
-            Xi_in = self._scale_model_input_safe(Xi.float(), t1d, self.scheduler)
+            t1d = self._as_1d_timesteps(z, t, B)  # (B,)
+            z_in  = self._scale_model_input_safe(z,  t1d)
+            Xi_in = self._scale_model_input_safe(Xi.float(), t1d)
 
             hidden = torch.cat([z_in.float(), Xi_in, Mi.float()], dim=1)
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=30.0, neginf=-30.0).clamp_(-30.0, 30.0)
@@ -605,29 +592,28 @@ class CatVTON_SD3_Trainer:
             Xi = Xi * (1.0 - drop)
             Mi = Mi * (1.0 - drop)
 
-        # ---- Use TRAIN scheduler for t/noise/target ----
         timesteps = torch.randint(
-            0, self.train_scheduler.config.num_train_timesteps, (B,),
+            0, self.scheduler.config.num_train_timesteps, (B,),
             device=self.device, dtype=torch.long
         )
 
-        # --------- Build noisy & target (DDPM train scheduler) ---------
+        # --------- Build noisy & target (FlowMatchEuler 정식) ---------
         z0_f32     = z0.float()
         noise_f32  = torch.randn_like(z0_f32)
-        noisy_f32  = self.train_scheduler.add_noise(original_samples=z0_f32, noise=noise_f32, timesteps=timesteps)
+        noisy_f32  = self.scheduler.add_noise(original_samples=z0_f32, noise=noise_f32, timesteps=timesteps)
         noisy_f32  = torch.nan_to_num(noisy_f32, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        pred_type = getattr(self.train_scheduler.config, "prediction_type", "v_prediction")
+        pred_type = getattr(self.scheduler.config, "prediction_type", "v_prediction")
         if pred_type == "epsilon":
             target_f32 = noise_f32
         elif pred_type == "v_prediction":
-            target_f32 = self.train_scheduler.get_velocity(sample=z0_f32, noise=noise_f32, timesteps=timesteps)
+            target_f32 = self.scheduler.get_velocity(sample=z0_f32, noise=noise_f32, timesteps=timesteps)
         else:
             raise ValueError(f"Unsupported prediction_type: {pred_type}")
 
         # --------- (safe) preconditioning ---------
-        scaled_noisy_f32 = self._scale_model_input_safe(noisy_f32, timesteps, self.train_scheduler)
-        scaled_Xi_f32    = self._scale_model_input_safe(Xi.float(), timesteps, self.train_scheduler)
+        scaled_noisy_f32 = self._scale_model_input_safe(noisy_f32, timesteps)
+        scaled_Xi_f32    = self._scale_model_input_safe(Xi.float(), timesteps)
 
         hidden_cat_f32 = torch.cat([scaled_noisy_f32, scaled_Xi_f32, Mi.float()], dim=1)
         hidden_cat_f32 = torch.nan_to_num(hidden_cat_f32, nan=0.0, posinf=30.0, neginf=-30.0)
@@ -650,21 +636,13 @@ class CatVTON_SD3_Trainer:
             ).sample
 
         out_f32 = out.float()
-
-        # --------- Loss (emphasize left/try-on half using downsampled mask) ---------
-        # Mi: [B,1,h,2w]
-        h, w = out_f32.shape[-2], out_f32.shape[-1]
-        wmap = torch.ones((B, 1, h, w), device=out_f32.device, dtype=out_f32.dtype)
-        left_bin = (Mi[:, :, :, :w] > 0).float()  # Mi already sized (h,2w); use left half only
-        wmap[:, :, :, :w//2] = 1.0 + left_bin[:, :, :, :w//2]  # 2.0 where mask=1 on left
-        loss = torch.mean(((out_f32 - target_f32) ** 2) * wmap)
-
+        loss = F.mse_loss(out_f32, target_f32, reduction="mean")
         if not torch.isfinite(loss) or not loss.requires_grad:
             return None
         return loss
 
     def _save_ckpt(self, epoch: int, train_loss_epoch: float, global_step: int) -> str:
-        ckpt_path = os.path.join(self.model_dir, f"epoch_{epoch}_loss_{train_loss_epoch:.04f}.ckpt")
+        ckpt_path = os.path.join(self.model_dir, f"[Train]_[{epoch}]_[{train_loss_epoch:.04f}].ckpt")
         payload = {
             "transformer": ddp_state_dict(self.transformer),
             "projector": ddp_state_dict(self.projector),
@@ -673,8 +651,6 @@ class CatVTON_SD3_Trainer:
             "epoch": epoch,
             "global_step": global_step,
             "train_loss_epoch": float(train_loss_epoch),
-            "scheduler_config": self.scheduler.config.to_diff_dict() if hasattr(self.scheduler.config, "to_diff_dict")
-                             else dict(self.scheduler.config),
         }
         if self.is_main:
             torch.save(payload, ckpt_path)
@@ -823,7 +799,7 @@ DEFAULTS = {
     "size_h": 512, "size_w": 384,
     "mask_based": True, "invert_mask": False,
 
-    # opt (aligned closer to paper: LR 1e-5, cond-dropout 0.1)
+    # opt
     "lr": 1e-5, "batch_size": 4, "grad_accum": 1, "max_steps": 128000,
     "seed": 1337, "num_workers": 4, "cond_dropout_p": 0.1,
     "mixed_precision": "fp16", "loss_sigma_weight": False,
