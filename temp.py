@@ -1,31 +1,12 @@
 #!/usr/bin/env python3
 
-# ================================================================
-# SD3.5 CatVTON Training Script (Enhanced Version)
-# ================================================================
-# 
-# 이 스크립트는 Stable Diffusion 3.5를 기반으로 한 Virtual Try-On (VTON) 모델을 학습합니다.
-# 
-# 주요 기능:
-# 1. SD3.5 Transformer를 CatVTON 작업에 맞게 fine-tuning
-# 2. FlowMatch 스케줄러를 사용한 안정적인 학습
-# 3. Inpainting 방식의 의상 합성 학습
-# 4. 실시간 프리뷰 생성으로 학습 진행 모니터링
-# 5. 분산 학습 지원 (DDP)
-# 
-# 아키텍처:
-# - VAE: 이미지 ↔ latent 변환
-# - Transformer: SD3.5 기반 denoising 모델
-# - FlowMatch: 노이즈 스케줄링 및 샘플링
-# - Inpainting: 마스크 기반 의상 영역 합성
-# 
-# 학습 과정:
-# 1. 사람 이미지 + 의상 이미지 + 마스크 → 배치 구성
-# 2. VAE로 latent space 변환
-# 3. 마스크 기반 inpainting 입력 구성
-# 4. Transformer로 denoising 학습
-# 5. 주기적으로 프리뷰 이미지 생성
-# ================================================================
+# fixed_train_sd35_v2.py — SD3.5 CatVTON (Further Fixed version)
+# 주요 수정사항:
+# 1. 노이즈 스케일링 문제 해결
+# 2. 프리뷰 생성 로직 개선
+# 3. 마스크 처리 일관성 강화
+# 4. VAE 스케일링 팩터 정확히 적용
+# 5. 학습-추론 일관성 보장
 
 import os
 import re
@@ -430,11 +411,8 @@ class EnhancedCatVTON_SD3_Trainer:
         # HF 토큰 처리
         env_token = (os.environ.get("HUGGINGFACE_TOKEN")
                      or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-                     or os.environ.get("HF_TOKEN"))                     
-        #token = cfg.hf_token or env_token
-        token = env_token
-        
-        print(f"huggingface token : {token}")
+                     or os.environ.get("HF_TOKEN"))
+        token = cfg.hf_token or env_token
 
         # SD3.5 모델 로드
         if self.is_main:
@@ -546,6 +524,7 @@ class EnhancedCatVTON_SD3_Trainer:
         )
         
         self.logger.info(f"Dataset len={len(self.dataset)} batch_size(per-rank)={cfg.batch_size}")
+        self.logger.info("Enhanced mask semantics: Mi=1 KEEP, Mi=0 HOLE")
 
         if self.is_dist:
             self.steps_per_epoch = max(1, self.sampler.num_samples // cfg.batch_size)
@@ -665,56 +644,37 @@ class EnhancedCatVTON_SD3_Trainer:
         return torch.clamp((x + 1.0) * 0.5, 0.0, 1.0)
 
     def _enhanced_noise_schedule(self, x: torch.Tensor, timestep) -> torch.Tensor:
-        """스케줄러의 scale_model_input을 우선 사용, 없으면 안전한 fallback"""
-        # 가능한 경우 스케줄러 API 사용
-        scheduler = getattr(self, "_active_scheduler_for_scale", None)
-        if scheduler is not None and hasattr(scheduler, "scale_model_input"):
-            try:
-                return scheduler.scale_model_input(x, timestep)
-            except Exception:
-                pass
-
-        # Fallback: 이전의 보수적 스케일링(알파 계산)
+        """향상된 노이즈 스케일링 - 더 안정적인 방식"""
         if not torch.is_tensor(timestep):
             timestep = torch.tensor(timestep, device=x.device, dtype=torch.float32)
+        
         timestep = timestep.to(device=x.device, dtype=torch.float32)
         if timestep.ndim == 0:
             timestep = timestep[None]
+        
+        # SD3.5 권장 노이즈 스케일링
         sigma = timestep.view(-1, *([1] * (x.ndim - 1)))
+        
+        # FlowMatch의 정확한 스케일링 공식
         x_f32 = x.float()
         alpha_t = 1.0 / torch.sqrt(1.0 + sigma * sigma)
         return (x_f32 * alpha_t).to(x.dtype)
 
-    def _add_noise_with_scheduler(self, scheduler, clean_latents, noise, timestep):
-        """스케줄러의 add_noise/scale_noise를 우선 사용하고, 없으면 안전한 fallback."""
-        # timestep 정형화
+    def _consistent_add_noise(self, clean_latents, noise, timestep):
+        """일관된 노이즈 추가 방식 - 더 정확한 공식"""
         timestep = torch.as_tensor(timestep, device=clean_latents.device, dtype=torch.float32)
         if timestep.ndim == 0:
             timestep = timestep.view(1)
         if timestep.shape[0] != clean_latents.shape[0]:
             timestep = timestep[:1].repeat(clean_latents.shape[0])
-
-        # 1) diffusers API가 있으면 사용
-        if hasattr(scheduler, "add_noise"):
-            try:
-                return scheduler.add_noise(clean_latents, noise, timestep)
-            except Exception:
-                pass
         
-        # FlowMatch의 scale_noise 사용 (올바른 방법)
-        if hasattr(scheduler, "scale_noise"):
-            try:
-                # FlowMatch: scale_noise는 noise를 스케일링만 함
-                scaled_noise = scheduler.scale_noise(noise, timestep)
-                # FlowMatch 공식: x_t = x_0 + scaled_noise
-                return (clean_latents + scaled_noise).to(clean_latents.dtype)
-            except Exception:
-                pass
-
-        # 2) Fallback: 선형 혼합(정규화 t)
-        t_normalized = timestep.view(-1, 1, 1, 1) / 1000.0
+        # SD3.5 FlowMatch 공식: x_t = (1-t) * x_0 + t * noise
+        # 여기서 t는 정규화된 timestep (0~1 범위)
+        t_normalized = timestep.view(-1, 1, 1, 1) / 1000.0  # 1000은 max timesteps
         t_normalized = torch.clamp(t_normalized, 0.0, 1.0)
-        return ((1.0 - t_normalized) * clean_latents.float() + t_normalized * noise.float()).to(clean_latents.dtype)
+        
+        return ((1.0 - t_normalized) * clean_latents.float() + 
+                t_normalized * noise.float()).to(clean_latents.dtype)
 
     @torch.no_grad()
     def _enhanced_preview_sample(self, num_steps: int, start_latents: torch.Tensor, 
@@ -739,8 +699,6 @@ class EnhancedCatVTON_SD3_Trainer:
         scheduler, timesteps = setup_enhanced_timesteps(
             self.infer_scheduler, num_steps, device, self.infer_mu
         )
-        # 모델 입력 스케일링 시 사용할 활성 스케줄러 지정
-        self._active_scheduler_for_scale = scheduler
 
         # 시작 인덱스 결정
         if start_idx_override is None:
@@ -761,11 +719,10 @@ class EnhancedCatVTON_SD3_Trainer:
 
         # 초기 노이즈 상태
         t0 = timesteps_sub[0]
-        start_noisy = self._add_noise_with_scheduler(scheduler, start_latents.float(), shared_noise, t0)
+        start_noisy = self._consistent_add_noise(start_latents.float(), shared_noise, t0)
         
-        # 인페인팅 혼합 제거: 전체 입력 노이즈만 사용
-        z0_noisy_t0 = self._add_noise_with_scheduler(scheduler, start_latents.float(), shared_noise, t0)
-        z = start_noisy
+        # 인페인팅 초기화: KEEP 영역은 원본, HOLE 영역은 노이즈
+        z = Mi * start_noisy + (1.0 - Mi) * shared_noise * (t0 / 1000.0)
 
         # 프롬프트 임베딩
         prompt_embeds, pooled = self._encode_prompts(B)
@@ -779,16 +736,13 @@ class EnhancedCatVTON_SD3_Trainer:
                 t_curr = timesteps_sub[i].to(device, torch.float32)
                 t_next = timesteps_sub[i + 1].to(device, torch.float32)
                 
-                # dt 먼저 계산
-                dt = t_next - t_curr
-                
                 t_batch = t_curr.expand(B).to(device)
                 
                 # 모델 입력 스케일링
                 z_scaled = self._enhanced_noise_schedule(z, t_batch)
                 
                 with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=(device.type=='cuda')):
-                    raw_model_output = model(
+                    model_output = model(
                         hidden_states=z_scaled.to(dtype),
                         timestep=t_batch,
                         encoder_hidden_states=prompt_embeds,
@@ -796,27 +750,16 @@ class EnhancedCatVTON_SD3_Trainer:
                         return_dict=True,
                     ).sample.float()
 
-                # 학습과 동일한 공식 사용
-                pred_type = str(getattr(self.train_scheduler.config, "prediction_type", "epsilon")).lower()
-                
-                if pred_type == "epsilon":
-                    # epsilon prediction: z_0 = z_t - σ * ε (학습과 동일)
-                    sigma_curr = (t_curr / 1000.0).clamp(min=1e-8)  # 정규화된 timestep
-                    x0_pred = z - sigma_curr * raw_model_output
-                    model_output = (x0_pred - z) / dt  # velocity for Euler
-                elif pred_type in ("x0", "sample"):
-                    # direct x0 prediction
-                    x0_pred = raw_model_output
-                    model_output = (x0_pred - z) / dt  # velocity for Euler
-                else:
-                    raise NotImplementedError(f"v_prediction not supported, got {pred_type}")
-
                 # Euler 스텝
+                dt = t_next - t_curr
                 z_next = z + dt * model_output
                 
-                # CatVTON 방식: 재합성 없이 전체 이미지 생성
-                # 재합성/혼합 제거: 항상 순수 생성 결과만 사용
-                z = z_next
+                # 인페인팅 재합성
+                if t_next > 1e-7:
+                    init_latents_proper = self._consistent_add_noise(start_latents.float(), shared_noise, t_next)
+                    z = Mi * init_latents_proper + (1.0 - Mi) * z_next
+                else:
+                    z = Mi * start_latents.float() + (1.0 - Mi) * z_next
 
             # VAE 디코드 및 최종 합성
             x_hat = from_latent_sd3(self.vae, z.to(dtype))
@@ -825,24 +768,14 @@ class EnhancedCatVTON_SD3_Trainer:
             # 하지만 여전히 극단적인 saturation은 방지
             x_hat = torch.clamp(x_hat, -1.2, 1.2)
             
-            # CatVTON 방식: GT 복사 없이 전체 이미지 출력
-            if getattr(self.cfg, "remove_inpainting", True):
-                # 전체 생성된 이미지 사용 (GT 복사 없음)
-                x_final = x_hat
-                
-                # 디버깅
-                if self.is_main:
-                    self.logger.info(f"CatVTON debug - full image range: [{x_hat.min():.3f}, {x_hat.max():.3f}]")
-                    
-            else:
-                # 기존 inpainting 방식 (호환성)
-                K3_keep = m.to(device, dtype).repeat(1, 3, 1, 1)
-                x_final = K3_keep * pixels_for_keep.to(device, dtype) + (1.0 - K3_keep) * x_hat
-                
-                # 디버깅: saturation 체크
-                if self.is_main:
-                    self.logger.info(f"Inpaint debug - x_hat range: [{x_hat.min():.3f}, {x_hat.max():.3f}]")
-                    self.logger.info(f"Inpaint debug - x_final range: [{x_final.min():.3f}, {x_final.max():.3f}]")
+            K3_keep = m.to(device, dtype).repeat(1, 3, 1, 1)
+            x_final = K3_keep * pixels_for_keep.to(device, dtype) + (1.0 - K3_keep) * x_hat
+            
+            # 디버깅: saturation 체크
+            if self.is_main:
+                self.logger.info(f"Preview debug - x_hat range (after clamp): [{x_hat.min():.3f}, {x_hat.max():.3f}]")
+                self.logger.info(f"Preview debug - x_final range: [{x_final.min():.3f}, {x_final.max():.3f}]")
+                self.logger.info(f"Preview debug - pixels_for_keep range: [{pixels_for_keep.min():.3f}, {pixels_for_keep.max():.3f}]")
             
             return torch.clamp((x_final + 1.0) * 0.5, 0.0, 1.0).detach().cpu()
             
@@ -863,6 +796,30 @@ class EnhancedCatVTON_SD3_Trainer:
                 del x_hat
             if 'x_final' in locals():
                 del x_final
+                
+    def _calculate_mu_for_resolution(self, height, width, transformer):
+        """SD3.5의 정확한 mu 계산 방식"""
+        # SD3.5 dynamic shifting 파라미터들
+        base_shift = 0.5
+        max_shift = 1.15
+        base_image_seq_len = 256
+        max_image_seq_len = 4096
+        
+        # VAE 스케일링과 패치 크기 고려
+        vae_scale_factor = 8
+        patch_size = getattr(transformer.config, "patch_size", 2)
+        
+        # 이미지 토큰 길이 계산 (concat된 이미지이므로 2W)
+        h_tokens = height // vae_scale_factor // patch_size
+        w_tokens = (2 * width) // vae_scale_factor // patch_size
+        image_seq_len = h_tokens * w_tokens
+        
+        # Dynamic shifting 계산 공식
+        mu = base_shift + (max_shift - base_shift) * max(0.0, 
+            (image_seq_len - base_image_seq_len) / max(1.0, (max_image_seq_len - base_image_seq_len)))
+        mu = max(base_shift, min(max_shift, mu))
+        
+        return mu
 
     @torch.no_grad()
     def _save_enhanced_preview(self, batch: Dict[str, torch.Tensor], global_step: int, max_rows: int = 4):
@@ -887,8 +844,12 @@ class EnhancedCatVTON_SD3_Trainer:
                 self.logger.warning(f"Empty tensors detected, skipping preview")
                 return
 
-            # (삭제) 마스크 통계 로깅: hole 개념 제거
-            self._mask_keep_logged = True
+            # 마스크 통계 로깅 (한 번만)
+            if not self._mask_keep_logged:
+                keep_ratio = m[:, :, :, : m.shape[-1] // 2].float().mean().item()
+                hole_ratio = 1.0 - keep_ratio
+                self.logger.info(f"[mask] KEEP ratio={keep_ratio:.3f}, HOLE ratio={hole_ratio:.3f}")
+                self._mask_keep_logged = True
 
             num_steps = max(4, int(self.cfg.preview_infer_steps))
             self.logger.info(f"Preview inference steps: {num_steps}")
@@ -930,20 +891,17 @@ class EnhancedCatVTON_SD3_Trainer:
 
             # 초기 노이즈 상태 시각화
             self.logger.info("Generating noise visualization")
-            scheduler, timesteps = setup_enhanced_timesteps(self.infer_scheduler, num_steps, self.device, self.infer_mu)
-            N = len(timesteps) - 1
-            start_idx = min(max(int((1.0 - strength) * N), 0), N - 1)
-            t0 = timesteps[start_idx]
+            scheduler_vis = FM.from_config(self.infer_scheduler.config)
+            scheduler_vis.set_timesteps(num_steps, device=device)
+            timesteps = scheduler_vis.timesteps
             
             Mi_lat = F.interpolate(
                 m, size=(self.cfg.size_h // self.vae_scale_factor, (2 * self.cfg.size_w) // self.vae_scale_factor),
                 mode="nearest"
             ).float()
             
-            Xi_noisy0 = self._add_noise_with_scheduler(scheduler, Xi_lat, shared_noise, t0)
-            # 혼합 제거: 입력 노이즈만 시각화
-            pure_noisy0 = self._add_noise_with_scheduler(scheduler, torch.zeros_like(Xi_lat), shared_noise, t0)
-            z_init_vis = Xi_noisy0
+            Xi_noisy0 = self._consistent_add_noise(Xi_lat, shared_noise, t0)
+            z_init_vis = Mi_lat * Xi_noisy0 + (1.0 - Mi_lat) * shared_noise * (t0 / 1000.0)
             xi_noisy_img = from_latent_sd3(self.vae, z_init_vis.to(self.dtype))
             
             # 노이즈 시각화도 관대한 clamp 적용
@@ -1124,13 +1082,13 @@ class EnhancedCatVTON_SD3_Trainer:
             self.logger.info(f"Enhanced timesteps range: [{timesteps_all[0]:.1f}, {timesteps_all[-1]:.1f}]")
             self.logger.info(f"Sample timesteps: {timesteps[:3].cpu().tolist()}")
 
-        # 일관된 노이즈 주입 - 스케줄러 API 우선
-        self._active_scheduler_for_scale = scheduler
-        z0_noisy = self._add_noise_with_scheduler(scheduler, z0, noise, timesteps)
-        Xi_noisy = self._add_noise_with_scheduler(scheduler, Xi, noise, timesteps)
+        # 일관된 노이즈 주입
+        z0_noisy = self._consistent_add_noise(z0, noise, timesteps)
+        Xi_noisy = self._consistent_add_noise(Xi, noise, timesteps)
 
-        # 인페인팅 혼합 제거: 전체 입력 기반으로만 사용
-        noisy_model_input = Xi_noisy
+        # 인페인팅 입력 구성
+        t_norm = (timesteps.view(-1, 1, 1, 1) / 1000.0).clamp(0, 1)
+        noisy_model_input = Mi * Xi_noisy + (1.0 - Mi) * (noise * t_norm)
 
         # 모델 입력 스케일링
         hs = self._enhanced_noise_schedule(noisy_model_input, timesteps)
@@ -1148,99 +1106,44 @@ class EnhancedCatVTON_SD3_Trainer:
                 return_dict=False,
             )[0].float()
 
-        # inference.py와 동일한 공식 사용
-        pred_type = str(getattr(self.train_scheduler.config, "prediction_type", "epsilon")).lower()
-        
-        if pred_type == "epsilon":
-            # epsilon prediction: z_0 = z_t - σ * ε 
-            # sigma는 정규화된 timestep 사용 (0-1 범위)
-            sigma4 = (timesteps.view(-1, 1, 1, 1) / 1000.0).clamp(min=1e-8)
-            x0_pred = noisy_model_input - sigma4 * model_output
-        elif pred_type in ("x0", "sample"):
-            # direct x0 prediction
-            x0_pred = model_output
-        else:
-            # v_prediction (미지원)
-            raise NotImplementedError(f"v_prediction not supported, got {pred_type}")
+        # 예측값을 x0로 변환 (FlowMatch에서는 velocity prediction)
+        # v = (z_1 - z_0), 따라서 z_0 = z_t - t * v
+        t_norm_4d = t_norm
+        x0_pred = noisy_model_input - t_norm_4d * model_output
 
         # 손실 계산 - HOLE 영역만 고려
         if getattr(self.cfg, "loss_sigma_weight", True):
-            # SD3.5 공식 가중치 사용            
-            weighting = compute_loss_weighting_for_sd3(
-                weighting_scheme=self.cfg.weighting_scheme, 
-                sigmas=timesteps / 1000.0
-            )
+            # timestep 기반 가중치
+            weighting = 1.0 / (1.0 + timesteps / 100.0)  # 높은 timestep일수록 낮은 가중치
         else:
             weighting = torch.ones_like(timesteps)
 
         target = z0  # GT latent
+        Hmask = (1.0 - Mi)  # HOLE mask (Mi=1 KEEP, Mi=0 HOLE)
         
-        # CatVTON 방식: 전체 이미지 loss + 영역별 가중치
-        if getattr(self.cfg, "use_weighted_loss", True):
-            # 영역별 가중치 맵 생성
-            B, C, H, W_total = x0_pred.shape
-            W_half = W_total // 2
-            
-            left_weight = float(getattr(self.cfg, "left_weight", 1.0))
-            right_weight = float(getattr(self.cfg, "right_weight", 0.05))
-            
-            weight_map = torch.ones_like(x0_pred)
-            weight_map[:, :, :, :W_half] = left_weight   # 왼쪽 사람 영역
-            weight_map[:, :, :, W_half:] = right_weight  # 오른쪽 의상 영역
-            
-            # 가중치 적용된 loss
-            diff = x0_pred - target
-            diff_weighted = diff * weight_map
-            loss_per_sample = weighting.view(-1, 1, 1, 1) * (diff_weighted ** 2)
-            
-            # 정규화 (배치 평균)
-            loss = loss_per_sample.mean()
-            
-        else:
-            # (삭제) 기존 HOLE 방식 분기: 사용하지 않음
-            diff = x0_pred - target
-            loss_per_sample = weighting.view(-1, 1, 1, 1) * (diff ** 2)
-            loss = loss_per_sample.mean()
+        # L2 loss in HOLE region only
+        diff = x0_pred - target
+        diff_masked = diff * Hmask
+        
+        # 가중 평균
+        B = diff_masked.shape[0]
+        loss_per_sample = weighting.view(-1, 1, 1, 1) * (diff_masked ** 2)
+        
+        # 정규화 (HOLE 영역 크기로 나누기)
+        hole_pixels = Hmask.view(B, -1).sum(dim=1).clamp_min(1.0)
+        loss_normalized = loss_per_sample.view(B, -1).sum(dim=1) / hole_pixels
+        loss = loss_normalized.mean()
 
-        # 디버그 정보 (loss 방식에 따라 다르게 계산)
-        if getattr(self.cfg, "use_weighted_loss", True):
-            # CatVTON 방식 디버그 정보
-            dbg = {
-                "t_min": float(timesteps.min()),
-                "t_max": float(timesteps.max()),
-                "w_mean": float(weighting.mean()),
-                "mse_raw": float((diff ** 2).mean()),
-                "target_var": float(target.var()),
-                "pred_var": float(x0_pred.var()),
-                "left_ratio": float(getattr(self.cfg, "left_weight", 1.0)),
-                "right_ratio": float(getattr(self.cfg, "right_weight", 0.05)),
-                "model_out_min": float(model_output.min()),
-                "model_out_max": float(model_output.max()),
-                "x0_pred_min": float(x0_pred.min()),
-                "x0_pred_max": float(x0_pred.max()),
-                "target_min": float(target.min()),
-                "target_max": float(target.max()),
-                "loss_type": "weighted_full",
-                "pred_type": pred_type,  # pred_type 추가
-            }
-        else:
-            # (삭제) HOLE 방식 디버그: 가중치 없는 전체 mse로 대체
-            dbg = {
-                "t_min": float(timesteps.min()),
-                "t_max": float(timesteps.max()),
-                "w_mean": float(weighting.mean()),
-                "mse_raw": float((diff ** 2).mean()),
-                "target_var": float(target.var()),
-                "pred_var": float(x0_pred.var()),
-                "model_out_min": float(model_output.min()),
-                "model_out_max": float(model_output.max()),
-                "x0_pred_min": float(x0_pred.min()),
-                "x0_pred_max": float(x0_pred.max()),
-                "target_min": float(target.min()),
-                "target_max": float(target.max()),
-                "loss_type": "unmasked_full",
-                "pred_type": pred_type,
-            }
+        # 디버그 정보
+        dbg = {
+            "t_min": float(timesteps.min()),
+            "t_max": float(timesteps.max()),
+            "w_mean": float(weighting.mean()),
+            "mse_raw": float(((diff * Hmask) ** 2).mean()),
+            "target_var": float(target.var()),
+            "pred_var": float(x0_pred.var()),
+            "hole_ratio": float(Hmask.mean()),
+        }
 
         if (not torch.isfinite(loss)) or (not loss.requires_grad):
             return None
@@ -1327,25 +1230,10 @@ class EnhancedCatVTON_SD3_Trainer:
         while global_step < self.cfg.max_steps:
             self.optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
-            # CatVTON 방식에 맞는 디버그 정보 초기화
-            if getattr(self.cfg, "use_weighted_loss", True):
-                dbg_acc = {
-                    "t_min": 0.0, "t_max": 0.0, "w_mean": 0.0,
-                    "mse_raw": 0.0, "target_var": 0.0, "pred_var": 0.0,
-                    "left_ratio": 0.0, "right_ratio": 0.0,
-                    "model_out_min": 0.0, "model_out_max": 0.0,
-                    "x0_pred_min": 0.0, "x0_pred_max": 0.0,
-                    "target_min": 0.0, "target_max": 0.0, 
-                    "loss_type": "", "pred_type": ""
-                }
-            else:
-                dbg_acc = {
-                    "t_min": 0.0, "t_max": 0.0, "w_mean": 0.0,
-                    "mse_raw": 0.0, "target_var": 0.0, "pred_var": 0.0,
-                    "model_out_min": 0.0, "model_out_max": 0.0,
-                    "x0_pred_min": 0.0, "x0_pred_max": 0.0,
-                    "target_min": 0.0, "target_max": 0.0, "loss_type": ""
-                }
+            dbg_acc = {
+                "t_min": 0.0, "t_max": 0.0, "w_mean": 0.0,
+                "mse_raw": 0.0, "target_var": 0.0, "pred_var": 0.0, "hole_ratio": 0.0
+            }
             
             valid_steps = 0
 
@@ -1376,10 +1264,7 @@ class EnhancedCatVTON_SD3_Trainer:
 
                 loss_accum += float(loss.detach().cpu()) * self.cfg.grad_accum
                 for k in dbg_acc.keys():
-                    if k in ["pred_type", "loss_type"]:
-                        dbg_acc[k] = dbg[k]  # 문자열은 마지막 값으로 덮어쓰기
-                    else:
-                        dbg_acc[k] += float(dbg[k])
+                    dbg_acc[k] += float(dbg[k])
                 valid_steps += 1
 
             if valid_steps == 0:
@@ -1415,8 +1300,7 @@ class EnhancedCatVTON_SD3_Trainer:
 
             # Debug info averaging
             for k in dbg_acc.keys():
-                if k not in ["pred_type", "loss_type"]:  # 문자열은 평균 계산 제외
-                    dbg_acc[k] /= max(1, valid_steps)
+                dbg_acc[k] /= max(1, valid_steps)
 
             # Logging
             if self.is_main and ((global_step % self.cfg.log_every) == 0 or global_step <= 5):
@@ -1430,11 +1314,8 @@ class EnhancedCatVTON_SD3_Trainer:
                     f"| loss={train_loss_avg:.5f} "
                     f"| t_range=[{dbg_acc['t_min']:.0f},{dbg_acc['t_max']:.0f}] "
                     f"| mse={dbg_acc['mse_raw']:.5f} "
-                    f"| type={dbg_acc.get('loss_type', 'unknown')} "
-                    f"| target_var={dbg_acc['target_var']:.4f} "
-                    f"| model_out=[{dbg_acc['model_out_min']:.2f},{dbg_acc['model_out_max']:.2f}] "
-                    f"| x0_pred=[{dbg_acc['x0_pred_min']:.2f},{dbg_acc['x0_pred_max']:.2f}] "
-                    f"| pred_type={dbg_acc['pred_type']}"
+                    f"| hole_ratio={dbg_acc['hole_ratio']:.3f} "
+                    f"| target_var={dbg_acc['target_var']:.4f}"
                 )
                 pbar.set_postfix_str(f"loss={train_loss_avg:.5f}")
                 self.logger.info(line)
@@ -1520,12 +1401,6 @@ ENHANCED_DEFAULTS = {
     "mode_scale": 1.29,
     "loss_sigma_weight": True,
 
-    # CatVTON Loss Weighting
-    "use_weighted_loss": True,
-    "left_weight": 1.0,
-    "right_weight": 0.05,
-    "remove_inpainting": True,
-
     # 향상된 프리뷰 설정
     "preview_infer_steps": 20,  # 더 빠른 프리뷰
     "preview_seed": 1234,
@@ -1544,8 +1419,8 @@ ENHANCED_DEFAULTS = {
 def parse_enhanced_args():
     p = argparse.ArgumentParser(description="Enhanced SD3.5 CatVTON Training")
     p.add_argument("--config", type=str, default="configs/claude.yaml", help="YAML config path")
-    p.add_argument("--list_file", type=str, default=None, help="Training data list file")
-    p.add_argument("--sd3_model", type=str, default=None, help="SD3.5 model")
+    p.add_argument("--list_file", type=str, default="DATA/VITON-HD/vitonhd_train_mask.csv", help="Training data list file")
+    p.add_argument("--sd3_model", type=str, default="stabilityai/stable-diffusion-3.5-medium", help="SD3.5 model")
     p.add_argument("--size_h", type=int, default=None)
     p.add_argument("--size_w", type=int, default=None)
     p.add_argument("--mask_based", action="store_true")
@@ -1577,15 +1452,6 @@ def parse_enhanced_args():
     p.add_argument("--fixed_prompt", type=str, default=None)
     p.add_argument("--disable_dynamic_shifting", action="store_true")
     p.add_argument("--enable_dynamic_shifting", action="store_true")
-    
-    # CatVTON 가중치 설정
-    p.add_argument("--use_weighted_loss", action="store_true")
-    p.add_argument("--disable_weighted_loss", action="store_true") 
-    p.add_argument("--left_weight", type=float, default=None)
-    p.add_argument("--right_weight", type=float, default=None)
-    p.add_argument("--remove_inpainting", action="store_true")
-    p.add_argument("--keep_inpainting", action="store_true")
-    
     return p.parse_args()
 
 def load_enhanced_config(args: argparse.Namespace) -> DotDict:
@@ -1627,17 +1493,6 @@ def load_enhanced_config(args: argparse.Namespace) -> DotDict:
 
     if getattr(args, "fixed_prompt", None) is not None:
         cfg["fixed_prompt"] = args.fixed_prompt
-
-    # CatVTON 가중치 플래그 처리
-    if getattr(args, "disable_weighted_loss", False):
-        cfg["use_weighted_loss"] = False
-    elif getattr(args, "use_weighted_loss", False):
-        cfg["use_weighted_loss"] = True
-        
-    if getattr(args, "keep_inpainting", False):
-        cfg["remove_inpainting"] = False
-    elif getattr(args, "remove_inpainting", False):
-        cfg["remove_inpainting"] = True
 
     return DotDict(cfg)
 

@@ -1,6 +1,8 @@
 list_file: DATA/VITON-HD/vitonhd_train_mask.csv
 sd3_model: stabilityai/stable-diffusion-3.5-large
 
+save_name: sd35_weighted_loss  # 업데이트된 이름
+
 size_h: 512
 size_w: 384
 
@@ -11,7 +13,7 @@ disable_text: true
 # Training (Updated)
 lr: 1.0e-4
 batch_size: 8  # 줄임 (메모리 절약)
-grad_accum: 4   # 늘림 (effective batch = 128 유지)
+grad_accum: 8   # 늘림 (effective batch = 128 유지)
 max_steps: 256000
 mixed_precision: bf16
 seed: 1337
@@ -24,10 +26,16 @@ logit_mean: 0.0
 logit_std: 1.0
 mode_scale: 1.29
 
+# CatVTON Loss Weighting (New)
+use_weighted_loss: true    # 영역별 가중치 loss 사용
+left_weight: 1.0          # 왼쪽 사람 영역 가중치 (강한 감독)
+right_weight: 0.05        # 오른쪽 의상 영역 가중치 (약한 감독)
+remove_inpainting: true   # GT 복사 제거, 전체 이미지 생성
+
 # Preview (Updated for SD3.5)
 preview_infer_steps: 28  # SD3.5 최적값
 preview_seed: 1234
-preview_strength: 0.40    # 적당한 디노이징 (너무 높으면 t가 과도해서 불안정함)
+preview_strength: 0.30   # 적당한 디노이징 (너무 높으면 t가 과도해서 불안정함)
 preview_rows: 2          # 메모리 절약을 위해 줄임
 
 # Checkpoints & Logging
@@ -35,7 +43,6 @@ save_epoch_ckpt: 25
 default_resume_ckpt: null
 resume_ckpt: null
 save_root_dir: logs
-save_name: fixed_catvton_sd35  # 업데이트된 이름
 log_every: 10
 image_every: 100
 

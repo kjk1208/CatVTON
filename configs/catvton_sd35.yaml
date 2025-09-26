@@ -1,0 +1,28 @@
+# configs/catvton_sd35.yaml
+list_file: DATA/VITON-HD/vitonhd_train_mask.csv
+sd3_model: stabilityai/stable-diffusion-3.5-large
+size_h: 512
+size_w: 384
+mask_based: true          # Stage-1은 true, Stage-2는 false
+invert_mask: true         # 의류 마스크 반대로 적용
+lr: 1.0e-5
+batch_size: 8
+grad_accum: 1
+max_steps: 256000         # 16000
+cond_dropout_p: 0.1
+mixed_precision: bf16     # H100이면 bf16 추천
+seed: 1337
+num_workers: 8
+preview_infer_steps : 16
+preview_seed : 1234
+save_epoch_ckpt : 15
+
+# logging
+save_root_dir: logs
+save_name: catvton_sd35_mask
+log_every: 5
+image_every: 1000
+save_every: 12800
+
+# optional
+hf_token: "${HUGGINGFACE_TOKEN}"
